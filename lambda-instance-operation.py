@@ -15,8 +15,6 @@ def instance_start(event, context):
     """ Start EC2 Instance """
     try:
         instance.start()
-        instance.wait_until_running()
-        instance.state
     except: 
         print('Start EC2 Instance Error')
         return 1
@@ -38,8 +36,6 @@ def instalce_stop(event, context):
     """ Stop EC2 Instance """
     try:
         instance.stop()
-        instance.wait_until_stopped()
-        instance.state
     except: 
         print('Stop EC2 Instance Error')
         return 1
