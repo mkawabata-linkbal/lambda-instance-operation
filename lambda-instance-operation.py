@@ -1,3 +1,15 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+"""
+# lambda-instance-operation
+
+This repository is AWS Lambda function's upload files.
+"""
+
+__authour__ = "masaru.kawabata"
+__version__ = 1.1
+
 import boto3
 
 def instance_start(event, context):
