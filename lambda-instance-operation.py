@@ -33,7 +33,7 @@ def instance_start(event, context):
 
     return 0
 
-def instalce_stop(event, context):
+def instance_stop(event, context):
     """ Create Connection """
     try:
         ec2 = boto3.resource('ec2', region_name='ap-northeast-1')
