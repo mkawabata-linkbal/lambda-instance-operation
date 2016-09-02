@@ -36,4 +36,4 @@ zip -r ../lambda-instance-operation.zip .
 
 ### see also
 
-- http://tech.linkbal.co.jp
+- http://tech.linkbal.co.jp/66/
