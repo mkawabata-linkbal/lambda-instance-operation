@@ -22,6 +22,7 @@ import xml.etree.cElementTree
 import copy
 import re
 import warnings
+import uuid
 
 from botocore.compat import unquote, json, six, unquote_str, \
     ensure_bytes, get_md5, MD5_AVAILABLE
@@ -30,6 +31,7 @@ from botocore.docs.utils import HideParamFromOperations
 from botocore.docs.utils import AppendParamDocumentation
 from botocore.signers import add_generate_presigned_url
 from botocore.signers import add_generate_presigned_post
+from botocore.signers import add_generate_db_auth_token
 from botocore.exceptions import ParamValidationError
 from botocore.exceptions import AliasConflictParameterError
 from botocore.exceptions import UnsupportedTLSVersionWarning
@@ -52,7 +54,7 @@ REGISTER_LAST = object()
 # to be as long as 255 characters, and bucket names can contain any
 # combination of uppercase letters, lowercase letters, numbers, periods
 # (.), hyphens (-), and underscores (_).
-VALID_BUCKET = re.compile('^[a-zA-Z0-9.\-_]{1,255}$')
+VALID_BUCKET = re.compile(r'^[a-zA-Z0-9.\-_]{1,255}$')
 VERSION_ID_SUFFIX = re.compile(r'\?versionId=[^\s]+$')
 
 
@@ -96,6 +98,39 @@ def _looks_like_special_case_error(http_response):
     return False
 
 
+def set_operation_specific_signer(context, signing_name, **kwargs):
+    """ Choose the operation-specific signer.
+
+    Individual operations may have a different auth type than the service as a
+    whole. This will most often manifest as operations that should not be
+    authenticated at all, but can include other auth modes such as sigv4
+    without body signing.
+    """
+    auth_type = context.get('auth_type')
+
+    # Auth type will be None if the operation doesn't have a configured auth
+    # type.
+    if not auth_type:
+        return
+
+    # Auth type will be the string value 'none' if the operation should not
+    # be signed at all.
+    if auth_type == 'none':
+        return botocore.UNSIGNED
+
+    if auth_type.startswith('v4'):
+        signature_version = 'v4'
+        if signing_name == 's3':
+            signature_version = 's3v4'
+
+        # If the operation needs an unsigned body, we set additional context
+        # allowing the signer to be aware of this.
+        if auth_type == 'v4-unsigned-body':
+            context['payload_signing_enabled'] = False
+
+        return signature_version
+
+
 def decode_console_output(parsed, **kwargs):
     if 'Output' in parsed:
         try:
@@ -107,6 +142,14 @@ def decode_console_output(parsed, **kwargs):
             parsed['Output'] = value
         except (ValueError, TypeError, AttributeError):
             logger.debug('Error decoding base64', exc_info=True)
+
+
+def generate_idempotent_uuid(params, model, **kwargs):
+    for name in model.idempotent_members:
+        if name not in params:
+            params[name] = str(uuid.uuid4())
+            logger.debug("injecting idempotency token (%s) into param '%s'." %
+                         (params[name], name))
 
 
 def decode_quoted_jsondoc(value):
@@ -210,6 +253,14 @@ def _needs_s3_sse_customization(params, sse_member_prefix):
             sse_member_prefix + 'KeyMD5' not in params)
 
 
+# NOTE: Retries get registered in two separate places in the botocore
+# code: once when creating the client and once when you load the service
+# model from the session. While at first this handler seems unneeded, it
+# would be a breaking change for the AWS CLI to have it removed. This is
+# because it relies on the service model from the session to create commands
+# and this handler respects operation granular retry logic while the client
+# one does not. If this is ever to be removed the handler, the client
+# will have to respect per-operation level retry configuration.
 def register_retries_for_service(service_data, session,
                                  service_name, **kwargs):
     loader = session.get_component('data_loader')
@@ -352,26 +403,8 @@ def _quote_source_header(value):
         return percent_encode(first, safe=SAFE_CHARS + '/') + version_id
 
 
-def copy_snapshot_encrypted(params, request_signer, **kwargs):
-    # The presigned URL that facilities copying an encrypted snapshot.
-    # If the user does not provide this value, we will automatically
-    # calculate on behalf of the user and inject the PresignedUrl
-    # into the requests.
-    # The params sent in the event don't quite sync up 100% so we're
-    # renaming them here until they can be updated in the event.
-    request_dict = params
-    params = request_dict['body']
-    if 'PresignedUrl' in params:
-        # If the customer provided this value, then there's nothing for
-        # us to do.
-        return
-    destination_region = request_signer._region_name
-    params['DestinationRegion'] = destination_region
-    # The request will be sent to the destination region, so we need
-    # to create an endpoint to the source region and create a presigned
-    # url based on the source endpoint.
-    source_region = params['SourceRegion']
-
+def _get_cross_region_presigned_url(request_signer, request_dict, model,
+                                    source_region, destination_region):
     # The better way to do this is to actually get the
     # endpoint_resolver and get the endpoint_url given the
     # source region.  In this specific case, we know that
@@ -381,14 +414,57 @@ def copy_snapshot_encrypted(params, request_signer, **kwargs):
     # I think eventually we should try to plumb through something
     # that allows us to resolve endpoints from regions.
     request_dict_copy = copy.deepcopy(request_dict)
+    request_dict_copy['body']['DestinationRegion'] = destination_region
     request_dict_copy['url'] = request_dict['url'].replace(
         destination_region, source_region)
     request_dict_copy['method'] = 'GET'
     request_dict_copy['headers'] = {}
-    presigned_url = request_signer.generate_presigned_url(
+    return request_signer.generate_presigned_url(
         request_dict_copy, region_name=source_region,
-        operation_name='CopySnapshot')
-    params['PresignedUrl'] = presigned_url
+        operation_name=model.name)
+
+
+def _get_presigned_url_source_and_destination_regions(request_signer, params):
+    # Gets the source and destination regions to be used
+    destination_region = request_signer._region_name
+    source_region = params.get('SourceRegion')
+    return source_region, destination_region
+
+
+def inject_presigned_url_ec2(params, request_signer, model, **kwargs):
+    # The customer can still provide this, so we should pass if they do.
+    if 'PresignedUrl' in params['body']:
+        return
+    src, dest = _get_presigned_url_source_and_destination_regions(
+        request_signer, params['body'])
+    url = _get_cross_region_presigned_url(
+        request_signer, params, model, src, dest)
+    params['body']['PresignedUrl'] = url
+    # EC2 Requires that the destination region be sent over the wire in
+    # addition to the source region.
+    params['body']['DestinationRegion'] = dest
+
+
+def inject_presigned_url_rds(params, request_signer, model, **kwargs):
+    # SourceRegion is not required for RDS operations, so it's possible that
+    # it isn't set. In that case it's probably a local copy so we don't need
+    # to do anything else.
+    if 'SourceRegion' not in params['body']:
+        return
+
+    src, dest = _get_presigned_url_source_and_destination_regions(
+        request_signer, params['body'])
+
+    # Since SourceRegion isn't actually modeled for RDS, it needs to be
+    # removed from the request params before we send the actual request.
+    del params['body']['SourceRegion']
+
+    if 'PreSignedUrl' in params['body']:
+        return
+
+    url = _get_cross_region_presigned_url(
+        request_signer, params, model, src, dest)
+    params['body']['PreSignedUrl'] = url
 
 
 def json_decode_policies(parsed, model, **kwargs):
@@ -572,13 +648,27 @@ def document_glacier_tree_hash_checksum():
         previous uploaded parts, using the algorithm described in
         `Glacier documentation <http://docs.aws.amazon.com/amazonglacier/latest/dev/checksum-calculations.html>`_.
 
-        But if you prefer, you can also use botocore.util.calculate_tree_hash()
+        But if you prefer, you can also use botocore.utils.calculate_tree_hash()
         to compute it from raw file by::
 
             checksum = calculate_tree_hash(open('your_file.txt', 'rb'))
 
         '''
     return AppendParamDocumentation('checksum', doc).append_documentation
+
+
+def document_cloudformation_get_template_return_type(section, event_name, **kwargs):
+    if 'response-params' in event_name:
+        template_body_section = section.get_section('TemplateBody')
+        type_section = template_body_section.get_section('param-type')
+        type_section.clear_text()
+        type_section.write('(*dict*) --')
+    elif 'response-example' in event_name:
+        parent = section.get_section('structure-value')
+        param_line = parent.get_section('TemplateBody')
+        value_portion = param_line.get_section('member-value')
+        value_portion.clear_text()
+        value_portion.write('{}')
 
 
 def switch_host_machinelearning(request, **kwargs):
@@ -589,7 +679,7 @@ def check_openssl_supports_tls_version_1_2(**kwargs):
     import ssl
     try:
         openssl_version_tuple = ssl.OPENSSL_VERSION_INFO
-        if openssl_version_tuple[0] < 1 or openssl_version_tuple[2] < 1:
+        if openssl_version_tuple < (1, 0, 1):
             warnings.warn(
                 'Currently installed openssl version: %s does not '
                 'support TLS 1.2, which is required for use of iot-data. '
@@ -733,23 +823,40 @@ class ParameterAlias(object):
         section.write(updated_content)
 
 
+class ClientMethodAlias(object):
+    def __init__(self, actual_name):
+        """ Aliases a non-extant method to an existing method.
+
+        :param actual_name: The name of the method that actually exists on
+            the client.
+        """
+        self._actual = actual_name
+
+    def __call__(self, client, **kwargs):
+        return getattr(client, self._actual)
+
 # This is a list of (event_name, handler).
 # When a Session is created, everything in this list will be
 # automatically registered with that Session.
 
 BUILTIN_HANDLERS = [
+    ('getattr.mturk.list_hi_ts_for_qualification_type',
+     ClientMethodAlias('list_hits_for_qualification_type')),
     ('before-parameter-build.s3.UploadPart',
      convert_body_to_file_like_object, REGISTER_LAST),
     ('before-parameter-build.s3.PutObject',
      convert_body_to_file_like_object, REGISTER_LAST),
     ('creating-client-class', add_generate_presigned_url),
     ('creating-client-class.s3', add_generate_presigned_post),
+    ('creating-client-class.rds', add_generate_db_auth_token),
     ('creating-client-class.iot-data', check_openssl_supports_tls_version_1_2),
     ('after-call.iam', json_decode_policies),
 
     ('after-call.ec2.GetConsoleOutput', decode_console_output),
     ('after-call.cloudformation.GetTemplate', json_decode_template_body),
     ('after-call.s3.GetBucketLocation', parse_get_bucket_location),
+
+    ('before-parameter-build', generate_idempotent_uuid),
 
     ('before-parameter-build.s3', validate_bucket_name),
 
@@ -788,7 +895,15 @@ BUILTIN_HANDLERS = [
     ('before-call.apigateway', add_accept_header),
     ('before-call.glacier.UploadArchive', add_glacier_checksums),
     ('before-call.glacier.UploadMultipartPart', add_glacier_checksums),
-    ('before-call.ec2.CopySnapshot', copy_snapshot_encrypted),
+    ('before-call.ec2.CopySnapshot', inject_presigned_url_ec2),
+    ('before-call.rds.CopyDBClusterSnapshot',
+     inject_presigned_url_rds),
+    ('before-call.rds.CreateDBCluster',
+     inject_presigned_url_rds),
+    ('before-call.rds.CopyDBSnapshot',
+     inject_presigned_url_rds),
+    ('before-call.rds.CreateDBInstanceReadReplica',
+     inject_presigned_url_rds),
     ('request-created.machinelearning.Predict', switch_host_machinelearning),
     ('needs-retry.s3.UploadPartCopy', check_for_200_error, REGISTER_FIRST),
     ('needs-retry.s3.CopyObject', check_for_200_error, REGISTER_FIRST),
@@ -802,23 +917,7 @@ BUILTIN_HANDLERS = [
         disable_signing),
     ('choose-signer.sts.AssumeRoleWithSAML', disable_signing),
     ('choose-signer.sts.AssumeRoleWithWebIdentity', disable_signing),
-    ('choose-signer.cognito-idp.ConfirmSignUp', disable_signing),
-    ('choose-signer.cognito-idp.VerifyUserAttribute', disable_signing),
-    ('choose-signer.cognito-idp.ForgotPassword', disable_signing),
-    ('choose-signer.cognito-idp.SignUp', disable_signing),
-    ('choose-signer.cognito-idp.UpdateUserAttributes', disable_signing),
-    ('choose-signer.cognito-idp.ConfirmForgotPassword', disable_signing),
-    ('choose-signer.cognito-idp.ResendConfirmationCode', disable_signing),
-    ('choose-signer.cognito-idp.GetUserAttributeVerificationCode',
-     disable_signing),
-    ('choose-signer.cognito-idp.GetUser', disable_signing),
-    ('choose-signer.cognito-idp.ChangePassword', disable_signing),
-    ('choose-signer.cognito-idp.GetOpenIdConfiguration', disable_signing),
-    ('choose-signer.cognito-idp.DeleteUser', disable_signing),
-    ('choose-signer.cognito-idp.SetUserSettings', disable_signing),
-    ('choose-signer.cognito-idp.GetJWKS', disable_signing),
-    ('choose-signer.cognito-idp.DeleteUserAttributes', disable_signing),
-    ('before-sign.s3', utils.fix_s3_host),
+    ('choose-signer', set_operation_specific_signer),
     ('before-parameter-build.s3.HeadObject', sse_md5),
     ('before-parameter-build.s3.GetObject', sse_md5),
     ('before-parameter-build.s3.PutObject', sse_md5),
@@ -849,12 +948,26 @@ BUILTIN_HANDLERS = [
      AutoPopulatedParam('checksum').document_auto_populated_param),
     ('docs.request-params.glacier.CompleteMultipartUpload.complete-section',
      document_glacier_tree_hash_checksum()),
+    # Cloudformation documentation customizations
+    ('docs.*.cloudformation.GetTemplate.complete-section',
+     document_cloudformation_get_template_return_type),
 
     # UserData base64 encoding documentation customizations
     ('docs.*.ec2.RunInstances.complete-section',
      document_base64_encoding('UserData')),
     ('docs.*.autoscaling.CreateLaunchConfiguration.complete-section',
      document_base64_encoding('UserData')),
+
+    # RDS PresignedUrl documentation customizations
+    ('docs.*.rds.CopyDBClusterSnapshot.complete-section',
+     AutoPopulatedParam('PreSignedUrl').document_auto_populated_param),
+    ('docs.*.rds.CreateDBCluster.complete-section',
+     AutoPopulatedParam('PreSignedUrl').document_auto_populated_param),
+    ('docs.*.rds.CopyDBSnapshot.complete-section',
+     AutoPopulatedParam('PreSignedUrl').document_auto_populated_param),
+    ('docs.*.rds.CreateDBInstanceReadReplica.complete-section',
+     AutoPopulatedParam('PreSignedUrl').document_auto_populated_param),
+
     # EC2 CopySnapshot documentation customizations
     ('docs.*.ec2.CopySnapshot.complete-section',
      AutoPopulatedParam('PresignedUrl').document_auto_populated_param),

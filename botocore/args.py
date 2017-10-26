@@ -20,7 +20,6 @@ import copy
 import logging
 
 import botocore.serialize
-from botocore.utils import fix_s3_host
 from botocore.signers import RequestSigner
 from botocore.config import Config
 from botocore.endpoint import EndpointCreator
@@ -31,11 +30,12 @@ logger = logging.getLogger(__name__)
 
 class ClientArgsCreator(object):
     def __init__(self, event_emitter, user_agent, response_parser_factory,
-                 loader):
+                 loader, exceptions_factory):
         self._event_emitter = event_emitter
         self._user_agent = user_agent
         self._response_parser_factory = response_parser_factory
         self._loader = loader
+        self._exceptions_factory = exceptions_factory
 
     def get_client_args(self, service_model, region_name, is_secure,
                         endpoint_url, verify, credentials, scoped_config,
@@ -50,25 +50,32 @@ class ClientArgsCreator(object):
         protocol = final_args['protocol']
         config_kwargs = final_args['config_kwargs']
         s3_config = final_args['s3_config']
+        partition = endpoint_config['metadata'].get('partition', None)
+
+        signing_region = endpoint_config['signing_region']
+        endpoint_region_name = endpoint_config['region_name']
+        if signing_region is None and endpoint_region_name is None:
+            signing_region, endpoint_region_name = \
+                self._get_default_s3_region(service_name, endpoint_bridge)
+            config_kwargs['region_name'] = endpoint_region_name
 
         event_emitter = copy.copy(self._event_emitter)
         signer = RequestSigner(
-            service_name, endpoint_config['signing_region'],
+            service_name, signing_region,
             endpoint_config['signing_name'],
             endpoint_config['signature_version'],
             credentials, event_emitter)
 
-        # Add any additional s3 configuration for client
         config_kwargs['s3'] = s3_config
-        self._conditionally_unregister_fix_s3_host(endpoint_url, event_emitter)
-
         new_config = Config(**config_kwargs)
         endpoint_creator = EndpointCreator(event_emitter)
 
         endpoint = endpoint_creator.create_endpoint(
-            service_model, region_name=endpoint_config['region_name'],
+            service_model, region_name=endpoint_region_name,
             endpoint_url=endpoint_config['endpoint_url'], verify=verify,
             response_parser_factory=self._response_parser_factory,
+            max_pool_connections=new_config.max_pool_connections,
+            proxies=new_config.proxies,
             timeout=(new_config.connect_timeout, new_config.read_timeout))
 
         serializer = botocore.serialize.create_serializer(
@@ -82,7 +89,9 @@ class ClientArgsCreator(object):
             'request_signer': signer,
             'service_model': service_model,
             'loader': self._loader,
-            'client_config': new_config
+            'client_config': new_config,
+            'partition': partition,
+            'exceptions_factory': self._exceptions_factory
         }
 
     def compute_client_args(self, service_model, client_config,
@@ -119,7 +128,11 @@ class ClientArgsCreator(object):
         if client_config is not None:
             config_kwargs.update(
                 connect_timeout=client_config.connect_timeout,
-                read_timeout=client_config.read_timeout)
+                read_timeout=client_config.read_timeout,
+                max_pool_connections=client_config.max_pool_connections,
+                proxies=client_config.proxies,
+                retries=client_config.retries
+            )
         s3_config = self.compute_s3_config(scoped_config,
                                            client_config)
         return {
@@ -172,11 +185,6 @@ class ClientArgsCreator(object):
 
         return s3_configuration
 
-    def _conditionally_unregister_fix_s3_host(self, endpoint_url, emitter):
-        # If the user is providing a custom endpoint, we should not alter it.
-        if endpoint_url is not None:
-            emitter.unregister('before-sign.s3', fix_s3_host)
-
     def _convert_config_to_bool(self, config_dict, keys):
         # Make sure any further modifications to this section of the config
         # will not affect the scoped config by making a copy of it.
@@ -189,3 +197,12 @@ class ClientArgsCreator(object):
             else:
                 config_copy[key] = False
         return config_copy
+
+    def _get_default_s3_region(self, service_name, endpoint_bridge):
+        # If a user is providing a custom URL, the endpoint resolver will
+        # refuse to infer a signing region. If we want to default to s3v4,
+        # we have to account for this.
+        if service_name == 's3':
+            endpoint = endpoint_bridge.resolve('s3')
+            return endpoint['signing_region'], endpoint['region_name']
+        return None, None

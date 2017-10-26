@@ -22,6 +22,7 @@ from operator import itemgetter
 import functools
 import time
 import calendar
+import json
 
 from botocore.exceptions import NoCredentialsError
 from botocore.utils import normalize_url_path, percent_encode_sequence
@@ -32,6 +33,7 @@ from botocore.compat import encodebytes
 from botocore.compat import six
 from botocore.compat import json
 from botocore.compat import MD5_AVAILABLE
+from botocore.compat import ensure_unicode
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +48,10 @@ ISO8601 = '%Y-%m-%dT%H:%M:%SZ'
 SIGV4_TIMESTAMP = '%Y%m%dT%H%M%SZ'
 SIGNED_HEADERS_BLACKLIST = [
     'expect',
-    'user-agent'
+    'user-agent',
+    'x-amzn-trace-id',
 ]
+UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
 
 
 class BaseSigner(object):
@@ -106,7 +110,7 @@ class SigV2Auth(BaseSigner):
             params = request.data
         else:
             # GET
-            params = request.param
+            params = request.params
         params['AWSAccessKeyId'] = self.credentials.access_key
         params['SignatureVersion'] = '2'
         params['SignatureMethod'] = 'HmacSHA256'
@@ -171,14 +175,26 @@ class SigV4Auth(BaseSigner):
         in the StringToSign.
         """
         header_map = HTTPHeaders()
-        split = urlsplit(request.url)
         for name, value in request.headers.items():
             lname = name.lower()
             if lname not in SIGNED_HEADERS_BLACKLIST:
                 header_map[lname] = value
         if 'host' not in header_map:
-            header_map['host'] = split.netloc
+            header_map['host'] = self._canonical_host(request.url)
         return header_map
+
+    def _canonical_host(self, url):
+        url_parts = urlsplit(url)
+        default_ports = {
+            'http': 80,
+            'https': 443
+        }
+        if any(url_parts.scheme == scheme and url_parts.port == port
+               for scheme, port in default_ports.items()):
+            # No need to include the port if it's the default port.
+            return url_parts.hostname
+        # Strip out auth if it's present in the netloc.
+        return url_parts.netloc.rsplit('@', 1)[-1]
 
     def canonical_query_string(self, request):
         # The query string can come from two parts.  One is the
@@ -225,10 +241,18 @@ class SigV4Auth(BaseSigner):
         headers = []
         sorted_header_names = sorted(set(headers_to_sign))
         for key in sorted_header_names:
-            value = ','.join(v.strip() for v in
+            value = ','.join(self._header_value(v) for v in
                              sorted(headers_to_sign.get_all(key)))
-            headers.append('%s:%s' % (key, value))
+            headers.append('%s:%s' % (key, ensure_unicode(value)))
         return '\n'.join(headers)
+
+    def _header_value(self, value):
+        # From the sigv4 docs:
+        # Lowercase(HeaderName) + ':' + Trimall(HeaderValue)
+        #
+        # The Trimall function removes excess white space before and after
+        # values, and converts sequential spaces to a single space.
+        return ' '.join(value.split())
 
     def signed_headers(self, headers_to_sign):
         l = ['%s' % n.lower().strip() for n in set(headers_to_sign)]
@@ -236,6 +260,10 @@ class SigV4Auth(BaseSigner):
         return ';'.join(l)
 
     def payload(self, request):
+        if not self._should_sha256_sign_payload(request):
+            # When payload signing is disabled, we use this static string in
+            # place of the payload checksum.
+            return UNSIGNED_PAYLOAD
         if request.body and hasattr(request.body, 'seek'):
             position = request.body.tell()
             read_chunksize = functools.partial(request.body.read,
@@ -252,6 +280,16 @@ class SigV4Auth(BaseSigner):
             return sha256(request.body).hexdigest()
         else:
             return EMPTY_SHA256_HASH
+
+    def _should_sha256_sign_payload(self, request):
+        # Payloads will always be signed over insecure connections.
+        if not request.url.startswith('https'):
+            return True
+
+        # Certain operations may have payload signing disabled by default.
+        # Since we don't have access to the operation model, we pass in this
+        # bit of metadata through the request context.
+        return request.context.get('payload_signing_enabled', True)
 
     def canonical_request(self, request):
         cr = [request.method.upper()]
@@ -344,6 +382,11 @@ class SigV4Auth(BaseSigner):
                 del request.headers['X-Amz-Security-Token']
             request.headers['X-Amz-Security-Token'] = self.credentials.token
 
+        if not request.context.get('payload_signing_enabled', True):
+            if 'X-Amz-Content-SHA256' in request.headers:
+                del request.headers['X-Amz-Content-SHA256']
+            request.headers['X-Amz-Content-SHA256'] = UNSIGNED_PAYLOAD
+
     def _set_necessary_date_headers(self, request):
         # The spec allows for either the Date _or_ the X-Amz-Date value to be
         # used so we check both.  If there's a Date header, we use the date
@@ -381,10 +424,7 @@ class S3SigV4Auth(SigV4Auth):
         if 'X-Amz-Content-SHA256' in request.headers:
             del request.headers['X-Amz-Content-SHA256']
 
-        if self._should_sha256_sign_payload(request):
-            request.headers['X-Amz-Content-SHA256'] = self.payload(request)
-        else:
-            request.headers['X-Amz-Content-SHA256'] = 'UNSIGNED-PAYLOAD'
+        request.headers['X-Amz-Content-SHA256'] = self.payload(request)
 
     def _should_sha256_sign_payload(self, request):
         # S3 allows optional body signing, so to minimize the performance
@@ -398,15 +438,27 @@ class S3SigV4Auth(SigV4Auth):
         if s3_config is None:
             s3_config = {}
 
+        # The explicit configuration takes precedence over any implicit
+        # configuration.
         sign_payload = s3_config.get('payload_signing_enabled', None)
         if sign_payload is not None:
             return sign_payload
 
-        if 'Content-MD5' in request.headers and 'https' in request.url and \
-                request.context.get('has_streaming_input', False):
+        # We require that both content-md5 be present and https be enabled
+        # to implicitly disable body signing. The combination of TLS and
+        # content-md5 is sufficiently secure and durable for us to be
+        # confident in the request without body signing.
+        if not request.url.startswith('https') or \
+                'Content-MD5' not in request.headers:
+            return True
+
+        # If the input is streaming we disable body signing by default.
+        if request.context.get('has_streaming_input', False):
             return False
 
-        return True
+        # If the S3-specific checks had no results, delegate to the generic
+        # checks.
+        return super(S3SigV4Auth, self)._should_sha256_sign_payload(request)
 
     def _normalize_url_path(self, path):
         # For S3, we do not normalize the path.
@@ -443,7 +495,8 @@ class SigV4QueryAuth(SigV4Auth):
         # have repeated keys so we know we have single element lists which we
         # can convert back to scalar values.
         query_dict = dict(
-            [(k, v[0]) for k, v in parse_qs(url_parts.query).items()])
+            [(k, v[0]) for k, v in
+             parse_qs(url_parts.query, keep_blank_values=True).items()])
         # The spec is particular about this.  It *has* to be:
         # https://<endpoint>?<operation params>&<auth params>
         # You can't mix the two types of params together, i.e just keep doing
@@ -452,11 +505,9 @@ class SigV4QueryAuth(SigV4Auth):
         # percent_encode_sequence(new_query_params)
         operation_params = ''
         if request.data:
-            # We also need to move the body params into the query string.
-            # request.data will be populated, for example, with query services
-            # which normally form encode the params into the body.
-            # This means that request.data is a dict() of the operation params.
-            query_dict.update(request.data)
+            # We also need to move the body params into the query string. To
+            # do this, we first have to convert it to a dict.
+            query_dict.update(self._get_body_as_dict(request))
             request.data = ''
         if query_dict:
             operation_params = percent_encode_sequence(query_dict) + '&'
@@ -473,6 +524,18 @@ class SigV4QueryAuth(SigV4Auth):
         p = url_parts
         new_url_parts = (p[0], p[1], p[2], new_query_string, p[4])
         request.url = urlunsplit(new_url_parts)
+
+    def _get_body_as_dict(self, request):
+        # For query services, request.data is form-encoded and is already a
+        # dict, but for other services such as rest-json it could be a json
+        # string or bytes. In those cases we attempt to load the data as a
+        # dict.
+        data = request.data
+        if isinstance(data, six.binary_type):
+            data = json.loads(data.decode('utf-8'))
+        elif isinstance(data, six.string_types):
+            data = json.loads(data)
+        return data
 
     def _inject_signature_to_request(self, request, signature):
         # Rather than calculating an "Authorization" header, for the query
@@ -501,7 +564,7 @@ class S3SigV4QueryAuth(SigV4QueryAuth):
         # "You don't include a payload hash in the Canonical Request, because
         # when you create a presigned URL, you don't know anything about the
         # payload. Instead, you use a constant string "UNSIGNED-PAYLOAD".
-        return "UNSIGNED-PAYLOAD"
+        return UNSIGNED_PAYLOAD
 
 
 class S3SigV4PostAuth(SigV4Auth):
@@ -562,7 +625,8 @@ class HmacV1Auth(BaseSigner):
                      'response-cache-control', 'response-content-disposition',
                      'response-content-encoding', 'delete', 'lifecycle',
                      'tagging', 'restore', 'storageClass', 'notification',
-                     'replication', 'requestPayment']
+                     'replication', 'requestPayment', 'analytics', 'metrics',
+                     'inventory']
 
     def __init__(self, credentials, service_name=None, region_name=None):
         self.credentials = credentials

@@ -8,7 +8,7 @@ This repository is AWS Lambda function's upload files.
 """
 
 __authour__ = "masaru.kawabata"
-__version__ = 1.1
+__version__ = 1.2
 
 import boto3
 

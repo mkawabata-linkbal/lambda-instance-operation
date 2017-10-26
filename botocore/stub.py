@@ -20,7 +20,22 @@ from botocore.exceptions import ParamValidationError, \
 from botocore.vendored.requests.models import Response
 
 
-ANY = object()
+class _ANY(object):
+    """
+    A helper object that compares equal to everything. Copied from
+    unittest.mock
+    """
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __repr__(self):
+        return '<ANY>'
+
+ANY = _ANY()
 
 
 class Stubber(object):
@@ -235,7 +250,7 @@ class Stubber(object):
 
     def add_client_error(self, method, service_error_code='',
                          service_message='', http_status_code=400,
-                         service_error_meta=None):
+                         service_error_meta=None, expected_params=None):
         """
         Adds a ``ClientError`` to the response queue.
 
@@ -256,6 +271,13 @@ class Stubber(object):
         :param service_error_meta: Additional keys to be added to the
             service Error
         :type service_error_meta: dict
+
+        :param expected_params: A dictionary of the expected parameters to
+            be called for the provided service response. The parameters match
+            the names of keyword arguments passed to that client call. If
+            any of the parameters differ a ``StubResponseError`` is thrown.
+            You can use stub.ANY to indicate a particular parameter to ignore
+            in validation.
         """
         http_response = Response()
         http_response.status_code = http_status_code
@@ -280,7 +302,7 @@ class Stubber(object):
         response = {
             'operation_name': operation_name,
             'response': (http_response, parsed_response),
-            'expected_params': None
+            'expected_params': expected_params,
         }
         self._queue.append(response)
 
@@ -319,10 +341,7 @@ class Stubber(object):
 
         # Validate the parameters are equal
         for param, value in expected_params.items():
-            if value is ANY:
-                continue
-            elif param not in params or \
-                    expected_params[param] != params[param]:
+            if param not in params or expected_params[param] != params[param]:
                 raise StubAssertionError(
                     operation_name=model.name,
                     reason='Expected parameters:\n%s,\nbut received:\n%s' % (

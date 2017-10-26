@@ -287,9 +287,11 @@ class Waiter(object):
     def wait(self, **kwargs):
         acceptors = list(self.config.acceptors)
         current_state = 'waiting'
-        sleep_amount = self.config.delay
+        # pop the invocation specific config
+        config = kwargs.pop('WaiterConfig', {})
+        sleep_amount = config.get('Delay', self.config.delay)
+        max_attempts = config.get('MaxAttempts', self.config.max_attempts)
         num_attempts = 0
-        max_attempts = self.config.max_attempts
 
         while True:
             response = self._operation_method(**kwargs)
@@ -303,11 +305,13 @@ class Waiter(object):
                 # transition to the failure state if an error
                 # response was received.
                 if 'Error' in response:
-                    # Transition to the failure state, which we can
-                    # just handle here by raising an exception.
+                    # Transition to a failure state, which we
+                    # can just handle here by raising an exception.
                     raise WaiterError(
                         name=self.name,
-                        reason=response['Error'].get('Message', 'Unknown'))
+                        reason=response['Error'].get('Message', 'Unknown'),
+                        last_response=response
+                    )
             if current_state == 'success':
                 logger.debug("Waiting complete, waiter matched the "
                              "success state.")
@@ -315,8 +319,13 @@ class Waiter(object):
             if current_state == 'failure':
                 raise WaiterError(
                     name=self.name,
-                    reason='Waiter encountered a terminal failure state')
+                    reason='Waiter encountered a terminal failure state',
+                    last_response=response,
+                )
             if num_attempts >= max_attempts:
-                raise WaiterError(name=self.name,
-                                  reason='Max attempts exceeded')
+                raise WaiterError(
+                    name=self.name,
+                    reason='Max attempts exceeded',
+                    last_response=response
+                )
             time.sleep(sleep_amount)

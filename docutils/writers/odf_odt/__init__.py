@@ -1,4 +1,4 @@
-# $Id: __init__.py 7717 2013-08-21 22:01:21Z milde $
+# $Id: __init__.py 8131 2017-07-03 22:06:53Z dkuhlman $
 # Author: Dave Kuhlman <dkuhlman@rexx.com>
 # Copyright: This module has been placed in the public domain.
 
@@ -20,33 +20,39 @@ import zipfile
 from xml.dom import minidom
 import time
 import re
-import StringIO
+import io
 import copy
-import urllib2
+import urllib.request, urllib.error, urllib.parse
+import itertools
 import docutils
+try:
+    import locale # module missing in Jython
+except ImportError:
+    pass
 from docutils import frontend, nodes, utils, writers, languages
 from docutils.readers import standalone
 from docutils.transforms import references
 
 
+IMAGE_NAME_COUNTER = itertools.count()
 WhichElementTree = ''
 try:
     # 1. Try to use lxml.
     #from lxml import etree
     #WhichElementTree = 'lxml'
     raise ImportError('Ignoring lxml')
-except ImportError, e:
+except ImportError as e:
     try:
         # 2. Try to use ElementTree from the Python standard library.
         from xml.etree import ElementTree as etree
         WhichElementTree = 'elementtree'
-    except ImportError, e:
+    except ImportError as e:
         try:
             # 3. Try to use a version of ElementTree installed as a separate
             #    product.
             from elementtree import ElementTree as etree
             WhichElementTree = 'elementtree'
-        except ImportError, e:
+        except ImportError as e:
             s1 = 'Must install either a version of Python containing ' \
                  'ElementTree (Python version >=2.5) or install ElementTree.'
             raise ImportError(s1)
@@ -56,9 +62,9 @@ except ImportError, e:
 try:
     import pygments
     import pygments.lexers
-    from pygmentsformatter import OdtPygmentsProgFormatter, \
+    from .pygmentsformatter import OdtPygmentsProgFormatter, \
         OdtPygmentsLaTeXFormatter
-except ImportError, exp:
+except (ImportError, SyntaxError) as exp:
     pygments = None
 
 # check for the Python Imaging Library
@@ -293,7 +299,7 @@ def SubElement(parent, tag, attrib=None, nsmap=None, nsdict=CNSD):
 def fix_ns(tag, attrib, nsdict):
     nstag = add_ns(tag, nsdict)
     nsattrib = {}
-    for key, val in attrib.iteritems():
+    for key, val in attrib.items():
         nskey = add_ns(key, nsdict)
         nsattrib[nskey] = val
     return nstag, nsattrib
@@ -303,12 +309,12 @@ def add_ns(tag, nsdict=CNSD):
         nstag, name = tag.split(':')
         ns = nsdict.get(nstag)
         if ns is None:
-            raise RuntimeError, 'Invalid namespace prefix: %s' % nstag
+            raise RuntimeError('Invalid namespace prefix: %s' % nstag)
         tag = '{%s}%s' % (ns, name,)
     return tag
 
 def ToString(et):
-    outstream = StringIO.StringIO()
+    outstream = io.StringIO()
     if sys.version_info >= (3, 2):
         et.write(outstream, encoding="unicode")
     else:
@@ -569,6 +575,48 @@ class Writer(writers.Writer):
         s1 = self.create_meta()
         self.write_zip_str(zfile, 'meta.xml', s1)
         s1 = self.get_stylesheet()
+        # Set default language in document to be generated.
+        # Language is specified by the -l/--language command line option.
+        # The format is described in BCP 47.  If region is omitted, we use
+        # local.normalize(ll) to obtain a region.
+        language_code = None
+        region_code = None
+        if self.visitor.language_code:
+            language_ids = self.visitor.language_code.replace('_', '-')
+            language_ids = language_ids.split('-')
+            # first tag is primary language tag
+            language_code = language_ids[0].lower()
+            # 2-letter region subtag may follow in 2nd or 3rd position
+            for subtag in language_ids[1:]:
+                if len(subtag) == 2 and subtag.isalpha():
+                    region_code = subtag.upper()
+                    break
+                elif len(subtag) == 1:
+                    break   # 1-letter tag is never before valid region tag
+            if region_code is None:
+                try:
+                    rcode = locale.normalize(language_code)
+                except NameError:
+                    rcode = language_code
+                rcode = rcode.split('_')
+                if len(rcode) > 1:
+                    rcode = rcode[1].split('.')
+                    region_code = rcode[0]
+                if region_code is None:
+                    self.document.reporter.warning(
+                        'invalid language-region.\n'
+                        '  Could not find region with locale.normalize().\n'
+                        '  Please specify both language and region (ll-RR).\n'
+                        '  Examples: es-MX (Spanish, Mexico),\n'
+                        '  en-AU (English, Australia).')
+        # Update the style ElementTree with the language and region.
+        # Note that we keep a reference to the modified node because
+        # it is possible that ElementTree will throw away the Python
+        # representation of the updated node if we do not.
+        updated, new_dom_styles, updated_node = self.update_stylesheet(
+            self.visitor.get_dom_stylesheet(), language_code, region_code)
+        if updated:
+            s1 = etree.tostring(new_dom_styles)
         self.write_zip_str(zfile, 'styles.xml', s1)
         self.store_embedded_files(zfile)
         self.copy_from_stylesheet(zfile)
@@ -580,11 +628,62 @@ class Writer(writers.Writer):
         self.parts['encoding'] = self.document.settings.output_encoding
         self.parts['version'] = docutils.__version__
 
-    def write_zip_str(self, zfile, name, bytes, compress_type=zipfile.ZIP_DEFLATED):
+    def update_stylesheet(self, stylesheet_root, language_code, region_code):
+        """Update xml style sheet element with language and region/country."""
+        updated = False
+        modified_nodes = set()
+        if language_code is not None or region_code is not None:
+            n1 = stylesheet_root.find(
+                '{urn:oasis:names:tc:opendocument:xmlns:office:1.0}'
+                'styles')
+            if n1 is None:
+                raise RuntimeError(
+                    "Cannot find 'styles' element in styles.odt/styles.xml")
+            n2_nodes = n1.findall(
+                '{urn:oasis:names:tc:opendocument:xmlns:style:1.0}'
+                'default-style')
+            if not n2_nodes:
+                raise RuntimeError(
+                    "Cannot find 'default-style' "
+                    "element in styles.xml")
+            for node in n2_nodes:
+                family = node.attrib.get(
+                    '{urn:oasis:names:tc:opendocument:xmlns:style:1.0}'
+                    'family')
+                if family == 'paragraph' or family == 'graphic':
+                    n3 = node.find(
+                        '{urn:oasis:names:tc:opendocument:xmlns:style:1.0}'
+                        'text-properties')
+                    if n3 is None:
+                        raise RuntimeError(
+                            "Cannot find 'text-properties' "
+                            "element in styles.xml")
+                    if language_code is not None:
+                        n3.attrib[
+                            '{urn:oasis:names:tc:opendocument:xmlns:'
+                            'xsl-fo-compatible:1.0}language'] = language_code
+                        n3.attrib[
+                            '{urn:oasis:names:tc:opendocument:xmlns:'
+                            'style:1.0}language-complex'] = language_code
+                        updated = True
+                        modified_nodes.add(n3)
+                    if region_code is not None:
+                        n3.attrib[
+                            '{urn:oasis:names:tc:opendocument:xmlns:'
+                            'xsl-fo-compatible:1.0}country'] = region_code
+                        n3.attrib[
+                            '{urn:oasis:names:tc:opendocument:xmlns:'
+                            'style:1.0}country-complex'] = region_code
+                        updated = True
+                        modified_nodes.add(n3)
+        return updated, stylesheet_root, modified_nodes
+
+    def write_zip_str(
+            self, zfile, name, bytes, compress_type=zipfile.ZIP_DEFLATED):
         localtime = time.localtime(time.time())
         zinfo = zipfile.ZipInfo(name, localtime)
         # Add some standard UNIX file access permissions (-rw-r--r--).
-        zinfo.external_attr = (0x81a4 & 0xFFFF) << 16L
+        zinfo.external_attr = (0x81a4 & 0xFFFF) << 16
         zinfo.compress_type = compress_type
         zfile.writestr(zinfo, bytes)
 
@@ -594,10 +693,8 @@ class Writer(writers.Writer):
             if source is None:
                 continue
             try:
-                # encode/decode
-                destination1 = destination.decode('latin-1').encode('utf-8')
-                zfile.write(source, destination1)
-            except OSError, e:
+                zfile.write(source, destination)
+            except OSError as e:
                 self.document.reporter.warning(
                     "Can't open file %s." % (source, ))
 
@@ -727,8 +824,8 @@ class Writer(writers.Writer):
         #s1 = doc.toprettyxml('  ')
         return s1
 
-# class ODFTranslator(nodes.SparseNodeVisitor):
 
+# class ODFTranslator(nodes.SparseNodeVisitor):
 class ODFTranslator(nodes.GenericNodeVisitor):
 
     used_styles = (
@@ -786,17 +883,19 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         'lineblock5',
         'lineblock6',
         'image', 'figureframe',
-        )
+    )
 
     def __init__(self, document):
         #nodes.SparseNodeVisitor.__init__(self, document)
         nodes.GenericNodeVisitor.__init__(self, document)
         self.settings = document.settings
-        lcode = self.settings.language_code
-        self.language = languages.get_language(lcode, document.reporter)
-        self.format_map = { }
+        self.language_code = self.settings.language_code
+        self.language = languages.get_language(
+            self.language_code,
+            document.reporter)
+        self.format_map = {}
         if self.settings.odf_config_file:
-            from ConfigParser import ConfigParser
+            from configparser import ConfigParser
 
             parser = ConfigParser()
             parser.read(self.settings.odf_config_file)
@@ -804,8 +903,9 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                 if rststyle not in self.used_styles:
                     self.document.reporter.warning(
                         'Style "%s" is not a style used by odtwriter.' % (
-                        rststyle, ))
-                self.format_map[rststyle] = format.decode('utf-8')
+                            rststyle, ))
+                if sys.version_info.major == 2:
+                    self.format_map[rststyle] = format.decode('utf-8')
         self.section_level = 0
         self.section_count = 0
         # Create ElementTree content and styles documents.
@@ -872,6 +972,8 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         self.table_styles = None
         self.in_citation = False
 
+        # Keep track of nested styling classes
+        self.inline_style_count_stack = []
 
     def get_str_stylesheet(self):
         return self.str_stylesheet
@@ -893,7 +995,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             s2 = zfile.read('content.xml')
             zfile.close()
         else:
-            raise RuntimeError, 'stylesheet path (%s) must be %s or .xml file' %(stylespath, extension)
+            raise RuntimeError('stylesheet path (%s) must be %s or .xml file' %(stylespath, extension))
         self.str_stylesheet = s1
         self.str_stylesheetcontent = s2
         self.dom_stylesheet = etree.fromstring(self.str_stylesheet)
@@ -982,18 +1084,18 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                 'style:name': style_name,
                 'style:master-page-name': "rststyle-pagedefault",
                 'style:family': "paragraph",
-                }, nsdict=SNSD)
+            }, nsdict=SNSD)
         if current_style:
             el1.set('style:parent-style-name', current_style)
         el.set('text:style-name', style_name)
 
-
-    def rststyle(self, name, parameters=( )):
+    def rststyle(self, name, parameters=()):
         """
         Returns the style name to use for the given style.
 
-        If `parameters` is given `name` must contain a matching number of ``%`` and
-        is used as a format expression with `parameters` as the value.
+        If `parameters` is given `name` must contain a matching number of
+        ``%`` and is used as a format expression with `parameters` as
+        the value.
         """
         name1 = name % parameters
         stylename = self.format_map.get(name1, 'rststyle-%s' % name1)
@@ -1010,16 +1112,19 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         new_content = etree.tostring(self.dom_stylesheet)
         return new_content
 
+    def get_dom_stylesheet(self):
+        return self.dom_stylesheet
+
     def setup_paper(self, root_el):
         try:
             fin = os.popen("paperconf -s 2> /dev/null")
-            w, h = map(float, fin.read().split())
+            w, h = list(map(float, fin.read().split()))
             fin.close()
         except:
             w, h = 612, 792     # default to Letter
         def walk(el):
             if el.tag == "{%s}page-layout-properties" % SNSD["style"] and \
-                    not el.attrib.has_key("{%s}page-width" % SNSD["fo"]):
+                    "{%s}page-width" % SNSD["fo"] not in el.attrib:
                 el.attrib["{%s}page-width" % SNSD["fo"]] = "%.3fpt" % w
                 el.attrib["{%s}page-height" % SNSD["fo"]] = "%.3fpt" % h
                 el.attrib["{%s}margin-left" % SNSD["fo"]] = \
@@ -1082,7 +1187,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                 elcustom = self.create_custom_headfoot(el2,
                     self.settings.custom_footer, 'footer', automatic_styles)
 
-    code_none, code_field, code_text = range(3)
+    code_none, code_field, code_text = list(range(3))
     field_pat = re.compile(r'%(..?)%')
 
     def create_custom_headfoot(self, parent, text, style_name, automatic_styles):
@@ -1098,12 +1203,12 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                     'd1', 'd2', 'd3', 'd4', 'd5',
                     's', 't', 'a'):
                     msg = 'bad field spec: %%%s%%' % (item[1], )
-                    raise RuntimeError, msg
+                    raise RuntimeError(msg)
                 el1 = self.make_field_element(parent,
                     item[1], style_name, automatic_styles)
                 if el1 is None:
                     msg = 'bad field spec: %%%s%%' % (item[1], )
-                    raise RuntimeError, msg
+                    raise RuntimeError(msg)
                 else:
                     current_element = el1
             else:
@@ -1476,7 +1581,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         return el
 
     def encode(self, text):
-        text = text.replace(u'\u00a0', " ")
+        text = text.replace('\u00a0', " ")
         return text
 
     #
@@ -1630,7 +1735,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             if self.settings.generate_oowriter_toc:
                 pass
             else:
-                if node.has_key('classes') and \
+                if 'classes' in node and \
                         'auto-toc' in node.attributes['classes']:
                     el = SubElement(self.current_element, 'text:list', attrib={
                         'text:style-name': self.rststyle('tocenumlist'),
@@ -2058,7 +2163,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         # Capture the image file.
         if 'uri' in node.attributes:
             source = node.attributes['uri']
-            if not source.startswith('http:'):
+            if not (source.startswith('http:') or source.startswith('https:')):
                 if not source.startswith(os.sep):
                     docsource, line = utils.get_source_line(node)
                     if docsource:
@@ -2077,9 +2182,9 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             self.image_count += 1
             filename = os.path.split(source)[1]
             destination = 'Pictures/1%08x%s' % (self.image_count, filename, )
-            if source.startswith('http:'):
+            if source.startswith('http:') or source.startswith('https:'):
                 try:
-                    imgfile = urllib2.urlopen(source)
+                    imgfile = urllib.request.urlopen(source)
                     content = imgfile.read()
                     imgfile.close()
                     imgfile2 = tempfile.NamedTemporaryFile('wb', delete=False)
@@ -2087,7 +2192,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                     imgfile2.close()
                     imgfilename = imgfile2.name
                     source = imgfilename
-                except urllib2.HTTPError, e:
+                except urllib.error.HTTPError as e:
                     self.document.reporter.warning(
                         "Can't open image url %s." % (source, ))
                 spec = (source, destination,)
@@ -2118,70 +2223,151 @@ class ODFTranslator(nodes.GenericNodeVisitor):
 
     def get_image_width_height(self, node, attr):
         size = None
+        unit = None
         if attr in node.attributes:
             size = node.attributes[attr]
-            unit = size[-2:]
-            if unit.isalpha():
-                size = size[:-2]
-            else:
-                unit = 'px'
+            size = size.strip()
+            # For conversion factors, see:
+            # http://www.unitconversion.org/unit_converter/typography-ex.html
             try:
-                size = float(size)
-            except ValueError, e:
+                if size.endswith('%'):
+                    if attr == 'height':
+                        # Percentage allowed for width but not height.
+                        raise ValueError('percentage not allowed for height')
+                    size = size.rstrip(' %')
+                    size = float(size) / 100.0
+                    unit = '%'
+                else:
+                    size, unit = convert_to_cm(size)
+            except ValueError as exp:
                 self.document.reporter.warning(
-                    'Invalid %s for image: "%s"' % (
-                        attr, node.attributes[attr]))
-            size = [size, unit]
-        return size
+                    'Invalid %s for image: "%s".  '
+                    'Error: "%s".' % (
+                        attr, node.attributes[attr], exp))
+        return size, unit
+
+    def convert_to_cm(self, size):
+        """Convert various units to centimeters.
+
+        Note that a call to this method should be wrapped in:
+            try: except ValueError:
+        """
+        size = size.strip()
+        if size.endswith('px'):
+            size = float(size[:-2]) * 0.026     # convert px to cm
+        elif size.endswith('in'):
+            size = float(size[:-2]) * 2.54      # convert in to cm
+        elif size.endswith('pt'):
+            size = float(size[:-2]) * 0.035     # convert pt to cm
+        elif size.endswith('pc'):
+            size = float(size[:-2]) * 2.371     # convert pc to cm
+        elif size.endswith('mm'):
+            size = float(size[:-2]) * 10.0      # convert mm to cm
+        elif size.endswith('cm'):
+            size = float(size[:-2])
+        else:
+            raise ValueError('unknown unit type')
+        unit = 'cm'
+        return size, unit
 
     def get_image_scale(self, node):
         if 'scale' in node.attributes:
+            scale = node.attributes['scale']
             try:
-                scale = int(node.attributes['scale'])
-                if scale < 1: # or scale > 100:
-                    self.document.reporter.warning(
-                        'scale out of range (%s), using 1.' % (scale, ))
-                    scale = 1
-                scale = scale * 0.01
-            except ValueError, e:
+                scale = int(scale)
+            except ValueError:
                 self.document.reporter.warning(
                     'Invalid scale for image: "%s"' % (
                         node.attributes['scale'], ))
+            if scale < 1:       # or scale > 100:
+                self.document.reporter.warning(
+                    'scale out of range (%s), using 1.' % (scale, ))
+                scale = 1
+            scale = scale * 0.01
         else:
             scale = 1.0
         return scale
 
     def get_image_scaled_width_height(self, node, source):
+        """Return the image size in centimeters adjusted by image attrs."""
         scale = self.get_image_scale(node)
-        width = self.get_image_width_height(node, 'width')
-        height = self.get_image_width_height(node, 'height')
-
+        width, width_unit = self.get_image_width_height(node, 'width')
+        height, _ = self.get_image_width_height(node, 'height')
         dpi = (72, 72)
         if PIL is not None and source in self.image_dict:
             filename, destination = self.image_dict[source]
             imageobj = PIL.Image.open(filename, 'r')
             dpi = imageobj.info.get('dpi', dpi)
             # dpi information can be (xdpi, ydpi) or xydpi
-            try: iter(dpi)
-            except: dpi = (dpi, dpi)
+            try:
+                iter(dpi)
+            except:
+                dpi = (dpi, dpi)
         else:
             imageobj = None
-
         if width is None or height is None:
             if imageobj is None:
                 raise RuntimeError(
                     'image size not fully specified and PIL not installed')
-            if width is None: width = [imageobj.size[0], 'px']
-            if height is None: height = [imageobj.size[1], 'px']
+            if width is None:
+                width = imageobj.size[0]
+                width = float(width) * 0.026        # convert px to cm
+            if height is None:
+                height = imageobj.size[1]
+                height = float(height) * 0.026      # convert px to cm
+            if width_unit == '%':
+                factor = width
+                image_width = imageobj.size[0]
+                image_width = float(image_width) * 0.026    # convert px to cm
+                image_height = imageobj.size[1]
+                image_height = float(image_height) * 0.026  # convert px to cm
+                line_width = self.get_page_width()
+                width = factor * line_width
+                factor = (factor * line_width) / image_width
+                height = factor * image_height
+        width *= scale
+        height *= scale
+        width = '%.2fcm' % width
+        height = '%.2fcm' % height
+        return width, height
 
-        width[0] *= scale
-        height[0] *= scale
-        if width[1] == 'px': width = [width[0] / dpi[0], 'in']
-        if height[1] == 'px': height = [height[0] / dpi[1], 'in']
-
-        width[0] = str(width[0])
-        height[0] = str(height[0])
-        return ''.join(width), ''.join(height)
+    def get_page_width(self):
+        """Return the document's page width in centimeters."""
+        root = self.get_dom_stylesheet()
+        nodes = root.iterfind(
+            './/{urn:oasis:names:tc:opendocument:xmlns:style:1.0}'
+            'page-layout/'
+            '{urn:oasis:names:tc:opendocument:xmlns:style:1.0}'
+            'page-layout-properties')
+        width = None
+        for node in nodes:
+            page_width = node.get(
+                '{urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0}'
+                'page-width')
+            margin_left = node.get(
+                '{urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0}'
+                'margin-left')
+            margin_right = node.get(
+                '{urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0}'
+                'margin-right')
+            if (page_width is None or
+                    margin_left is None or
+                    margin_right is None):
+                continue
+            try:
+                page_width, _ = self.convert_to_cm(page_width)
+                margin_left, _ = self.convert_to_cm(margin_left)
+                margin_right, _ = self.convert_to_cm(margin_right)
+            except ValueError as exp:
+                self.document.reporter.warning(
+                    'Stylesheet file contains invalid page width '
+                    'or margin size.')
+            width = page_width - margin_left - margin_right
+        if width is None:
+            # We can't find the width in styles, so we make a guess.
+            # Use a width of 6 in = 15.24 cm.
+            width = 15.24
+        return width
 
     def generate_figure(self, node, source, destination, current_element):
         caption = None
@@ -2222,6 +2408,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             el2 = SubElement(el1, 'style:text-properties', 
                 attrib=attrib, nsdict=SNSD)
         style_name = 'rstframestyle%d' % self.image_style_count
+        draw_name = 'graphics%d' % next(IMAGE_NAME_COUNTER)
         # Add the styles
         attrib = {
             'style:name': style_name,
@@ -2252,7 +2439,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             'style:graphic-properties', attrib=attrib, nsdict=SNSD)
         attrib = {
             'draw:style-name': style_name,
-            'draw:name': 'Frame1',
+            'draw:name': draw_name,
             'text:anchor-type': 'paragraph',
             'draw:z-index': '0',
             }
@@ -2326,12 +2513,13 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             attrib['style:wrap'] = 'none'
         el2 = SubElement(el1,
             'style:graphic-properties', attrib=attrib, nsdict=SNSD)
+        draw_name = 'graphics%d' % next(IMAGE_NAME_COUNTER)
         # Add the content.
         #el = SubElement(current_element, 'text:p',
         #    attrib={'text:style-name': self.rststyle('textbody')})
         attrib={
             'draw:style-name': style_name,
-            'draw:name': 'graphics2',
+            'draw:name': draw_name,
             'draw:z-index': '1',
             }
         if isinstance(node.parent, nodes.TextElement):
@@ -2399,14 +2587,26 @@ class ODFTranslator(nodes.GenericNodeVisitor):
 
     def visit_inline(self, node):
         styles = node.attributes.get('classes', ())
-        if len(styles) > 0:
-            inline_style =  styles[0]
-        el = SubElement(self.current_element, 'text:span',
-            attrib={'text:style-name': self.rststyle(inline_style)})
+        if styles:
+            el = self.current_element
+            for inline_style in styles:
+                el = SubElement(el, 'text:span',
+                                attrib={'text:style-name':
+                                        self.rststyle(inline_style)})
+            count = len(styles)
+        else:
+            # No style was specified so use a default style (old code
+            # crashed if no style was given)
+            el = SubElement(self.current_element, 'text:span')
+            count = 1
+
         self.set_current_element(el)
+        self.inline_style_count_stack.append(count)
 
     def depart_inline(self, node):
-        self.set_to_parent()
+        count = self.inline_style_count_stack.pop()
+        for x in range(count):
+            self.set_to_parent()
 
     def _calculate_code_block_padding(self, line):
         count = 0
@@ -2706,7 +2906,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
             if 'odt' in formatlist:
                 rawstr = node.astext()
                 attrstr = ' '.join(['%s="%s"' % (k, v, )
-                    for k,v in CONTENT_NAMESPACE_ATTRIB.items()])
+                    for k,v in list(CONTENT_NAMESPACE_ATTRIB.items())])
                 contentstr = '<stuff %s>%s</stuff>' % (attrstr, rawstr, )
                 if WhichElementTree != "lxml":
                     contentstr = contentstr.encode("utf-8")
@@ -2733,7 +2933,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
     def visit_reference(self, node):
         text = node.astext()
         if self.settings.create_links:
-            if node.has_key('refuri'):
+            if 'refuri' in node:
                     href = node['refuri']
                     if ( self.settings.cloak_email_addresses
                          and href.startswith('mailto:')):
@@ -2743,7 +2943,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
                         'xlink:type': 'simple',
                         })
                     self.set_current_element(el)
-            elif node.has_key('refid'):
+            elif 'refid' in node:
                 if self.settings.create_links:
                     href = node['refid']
                     el = self.append_child('text:reference-ref', attrib={
@@ -2760,7 +2960,7 @@ class ODFTranslator(nodes.GenericNodeVisitor):
 
     def depart_reference(self, node):
         if self.settings.create_links:
-            if node.has_key('refuri'):
+            if 'refuri' in node:
                 self.set_to_parent()
 
     def visit_rubric(self, node):
@@ -3008,8 +3208,8 @@ class ODFTranslator(nodes.GenericNodeVisitor):
         #
         # I don't know how to implement targets in ODF.
         # How do we create a target in oowriter?  A cross-reference?
-        if not (node.has_key('refuri') or node.has_key('refid')
-                or node.has_key('refname')):
+        if not ('refuri' in node or 'refid' in node
+                or 'refname' in node):
             pass
         else:
             pass
@@ -3251,14 +3451,19 @@ class ODFTranslator(nodes.GenericNodeVisitor):
     depart_admonition = depart_warning
 
     def generate_admonition(self, node, label, title=None):
-        el1 = SubElement(self.current_element, 'text:p', attrib = {
-            'text:style-name': self.rststyle('admon-%s-hdr', ( label, )),
-            })
+        if hasattr(self.language, 'labels'):
+            translated_label = self.language.labels[label]
+        else:
+            translated_label = label
+        el1 = SubElement(self.current_element, 'text:p', attrib={
+            'text:style-name': self.rststyle(
+                'admon-%s-hdr', (label, )),
+        })
         if title:
             el1.text = title
         else:
-            el1.text = '%s!' % (label.capitalize(), )
-        s1 = self.rststyle('admon-%s-body', ( label, ))
+            el1.text = '%s!' % (translated_label.capitalize(), )
+        s1 = self.rststyle('admon-%s-body', (label, ))
         self.paragraph_style_stack.append(s1)
 
     #

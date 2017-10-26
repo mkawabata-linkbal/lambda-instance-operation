@@ -1,4 +1,4 @@
-# $Id: __init__.py 7621 2013-03-04 13:20:49Z milde $
+# $Id: __init__.py 8024 2017-02-06 00:41:48Z goodger $
 # Author: David Goodger <goodger@python.org>
 # Copyright: This module has been placed in the public domain.
 
@@ -13,6 +13,7 @@ import codecs
 import sys
 
 from docutils import nodes
+from docutils.utils import split_escaped_whitespace, escape2null, unescape
 from docutils.parsers.rst.languages import en as _fallback_language_module
 if sys.version_info < (2,5):
     from docutils._compat import __import__
@@ -87,7 +88,7 @@ def directive(directive_name, language_module, document):
     canonicalname = None
     try:
         canonicalname = language_module.directives[normname]
-    except AttributeError, error:
+    except AttributeError as error:
         msg_text.append('Problem retrieving directive entry from language '
                         'module %r: %s.' % (language_module, error))
     except KeyError:
@@ -114,7 +115,7 @@ def directive(directive_name, language_module, document):
         return None, messages
     try:
         module = __import__(modulename, globals(), locals(), level=1)
-    except ImportError, detail:
+    except ImportError as detail:
         messages.append(document.reporter.error(
             'Error importing directive module "%s" (directive "%s"):\n%s'
             % (modulename, directive_name, detail),
@@ -170,7 +171,7 @@ def unchanged(argument):
     No argument implies empty string ("").
     """
     if argument is None:
-        return u''
+        return ''
     else:
         return argument  # unchanged!
 
@@ -189,7 +190,7 @@ def path(argument):
 
 def uri(argument):
     """
-    Return the URI argument with whitespace removed.
+    Return the URI argument with unescaped whitespace removed.
     (Directive option conversion function.)
 
     Raise ``ValueError`` if no argument is found.
@@ -197,7 +198,8 @@ def uri(argument):
     if argument is None:
         raise ValueError('argument required but none supplied')
     else:
-        uri = ''.join(argument.split())
+        parts = split_escaped_whitespace(escape2null(argument))
+        uri = ' '.join(''.join(unescape(part).split()) for part in parts)
         return uri
 
 def nonnegative_int(argument):
@@ -301,15 +303,15 @@ def unicode_code(code):
     """
     try:
         if code.isdigit():                  # decimal number
-            return unichr(int(code))
+            return chr(int(code))
         else:
             match = unicode_pattern.match(code)
             if match:                       # hex number
                 value = match.group(1) or match.group(2)
-                return unichr(int(value, 16))
+                return chr(int(value, 16))
             else:                           # other text
                 return code
-    except OverflowError, detail:
+    except OverflowError as detail:
         raise ValueError('code too large (%s)' % detail)
 
 def single_char_or_unicode(argument):
@@ -402,3 +404,15 @@ def choice(argument, values):
 def format_values(values):
     return '%s, or "%s"' % (', '.join(['"%s"' % s for s in values[:-1]]),
                             values[-1])
+
+def value_or(values, other):
+    """
+    The argument can be any of `values` or `argument_type`.
+    """
+    def auto_or_other(argument):
+        if argument in values:
+            return argument
+        else:
+            return other(argument)
+    return auto_or_other
+
