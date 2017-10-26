@@ -14,9 +14,12 @@ from concurrent import futures
 from collections import namedtuple
 import copy
 import logging
+import sys
 import threading
 
 from s3transfer.compat import MAXINT
+from s3transfer.compat import six
+from s3transfer.exceptions import CancelledError, TransferNotDoneError
 from s3transfer.utils import FunctionContainer
 from s3transfer.utils import TaskSemaphore
 
@@ -76,6 +79,14 @@ class TransferFuture(object):
         """Cancels the request associated with the TransferFuture"""
         self._coordinator.cancel()
 
+    def set_exception(self, exception):
+        """Sets the exception on the future."""
+        if not self.done():
+            raise TransferNotDoneError(
+                'set_exception can only be called once the transfer is '
+                'complete.')
+        self._coordinator.set_exception(exception, override=True)
+
 
 class TransferMeta(object):
     """Holds metadata about the TransferFuture"""
@@ -119,7 +130,7 @@ class TransferCoordinator(object):
     """A helper class for managing TransferFuture"""
     def __init__(self, transfer_id=None):
         self.transfer_id = transfer_id
-        self._status = 'queued'
+        self._status = 'not-started'
         self._result = None
         self._exception = None
         self._associated_futures = set()
@@ -130,6 +141,10 @@ class TransferCoordinator(object):
         self._associated_futures_lock = threading.Lock()
         self._done_callbacks_lock = threading.Lock()
         self._failure_cleanups_lock = threading.Lock()
+
+    def __repr__(self):
+        return '%s(transfer_id=%s)' % (
+            self.__class__.__name__, self.transfer_id)
 
     @property
     def exception(self):
@@ -158,7 +173,9 @@ class TransferCoordinator(object):
         """The status of the TransferFuture
 
         The currently supported states are:
-            * queued - Has yet to start
+            * not-started - Has yet to start. If in this state, a transfer
+              can be canceled immediately and nothing will happen.
+            * queued - SubmissionTask is about to submit tasks
             * running - Is inprogress. In-progress as of now means that
               the SubmissionTask that runs the transfer is being executed. So
               there is no guarantee any transfer requests had been made to
@@ -167,8 +184,7 @@ class TransferCoordinator(object):
             * failed - An exception other than CancelledError was thrown
             * success - No exceptions were thrown and is done.
         """
-        with self._lock:
-            return self._status
+        return self._status
 
     def set_result(self, result):
         """Set a result for the TransferFuture
@@ -185,13 +201,16 @@ class TransferCoordinator(object):
             self._result = result
             self._status = 'success'
 
-    def set_exception(self, exception):
+    def set_exception(self, exception, override=False):
         """Set an exception for the TransferFuture
 
         Implies the TransferFuture failed.
+
+        :param exception: The exception that cause the transfer to fail.
+        :param override: If True, override any existing state.
         """
-        if not self.done():
-            with self._lock:
+        with self._lock:
+            if not self.done() or override:
                 self._exception = exception
                 self._status = 'failed'
 
@@ -210,23 +229,42 @@ class TransferCoordinator(object):
 
         # Once done waiting, raise an exception if present or return the
         # final result.
-        with self._lock:
-            if self._exception:
-                raise self._exception
-            return self._result
+        if self._exception:
+            raise self._exception
+        return self._result
 
-    def cancel(self):
-        """Cancels the TransferFuture"""
-        if not self.done():
-            with self._lock:
-                logger.debug('TransferCoordinator cancel() called')
-                self._exception = futures.CancelledError
+    def cancel(self, msg='', exc_type=CancelledError):
+        """Cancels the TransferFuture
+
+        :param msg: The message to attach to the cancellation
+        :param exc_type: The type of exception to set for the cancellation
+        """
+        with self._lock:
+            if not self.done():
+                should_announce_done = False
+                logger.debug('%s cancel(%s) called', self, msg)
+                self._exception = exc_type(msg)
+                if self._status == 'not-started':
+                    should_announce_done = True
                 self._status = 'cancelled'
+                if should_announce_done:
+                    self.announce_done()
+
+    def set_status_to_queued(self):
+        """Sets the TransferFutrue's status to running"""
+        self._transition_to_non_done_state('queued')
 
     def set_status_to_running(self):
         """Sets the TransferFuture's status to running"""
+        self._transition_to_non_done_state('running')
+
+    def _transition_to_non_done_state(self, desired_state):
         with self._lock:
-            self._status = 'running'
+            if self.done():
+                raise RuntimeError(
+                    'Unable to transition from done state %s to non-done '
+                    'state %s.' % (self.status, desired_state))
+            self._status = desired_state
 
     def submit(self, executor, task, tag=None):
         """Submits a task to a provided executor
@@ -251,7 +289,8 @@ class TransferCoordinator(object):
         # Add this created future to the list of associated future just
         # in case it is needed during cleanups.
         self.add_associated_future(future)
-        future.add_done_callback(self.remove_associated_future)
+        future.add_done_callback(
+            FunctionContainer(self.remove_associated_future, future))
         return future
 
     def done(self):
@@ -330,7 +369,8 @@ class TransferCoordinator(object):
 class BoundedExecutor(object):
     EXECUTOR_CLS = futures.ThreadPoolExecutor
 
-    def __init__(self, max_size, max_num_threads, tag_semaphores=None):
+    def __init__(self, max_size, max_num_threads, tag_semaphores=None,
+                 executor_cls=None):
         """An executor implentation that has a maximum queued up tasks
 
         The executor will block if the number of tasks that have been
@@ -348,9 +388,16 @@ class BoundedExecutor(object):
         :params tag_semaphores: A dictionary where the key is the name of the
             tag and the value is the semaphore to use when limiting the
             number of tasks the executor is processing at a time.
+
+        :type executor_cls: BaseExecutor
+        :param underlying_executor_cls: The executor class that
+            get bounded by this executor. If None is provided, the
+            concurrent.futures.ThreadPoolExecutor class is used.
         """
         self._max_num_threads = max_num_threads
-        self._executor = self.EXECUTOR_CLS(max_workers=self._max_num_threads)
+        if executor_cls is None:
+            executor_cls = self.EXECUTOR_CLS
+        self._executor = executor_cls(max_workers=self._max_num_threads)
         self._semaphore = TaskSemaphore(max_size)
         self._tag_semaphores = tag_semaphores
 
@@ -385,23 +432,128 @@ class BoundedExecutor(object):
         release_callback = FunctionContainer(
             semaphore.release, task.transfer_id, acquire_token)
         # Submit the task to the underlying executor.
-        future = self._executor.submit(task)
+        future = ExecutorFuture(self._executor.submit(task))
         # Add the Semaphore.release() callback to the future such that
         # it is invoked once the future completes.
-        self._add_done_callback_to_future(future, release_callback)
+        future.add_done_callback(release_callback)
         return future
 
     def shutdown(self, wait=True):
         self._executor.shutdown(wait)
 
-    def _add_done_callback_to_future(self, future, callback):
+
+class ExecutorFuture(object):
+    def __init__(self, future):
+        """A future returned from the executor
+
+        Currently, it is just a wrapper around a concurrent.futures.Future.
+        However, this can eventually grow to implement the needed functionality
+        of concurrent.futures.Future if we move off of the library and not
+        affect the rest of the codebase.
+
+        :type future: concurrent.futures.Future
+        :param future: The underlying future
+        """
+        self._future = future
+
+    def result(self):
+        return self._future.result()
+
+    def add_done_callback(self, fn):
+        """Adds a callback to be completed once future is done
+
+        :parm fn: A callable that takes no arguments. Note that is different
+            than concurrent.futures.Future.add_done_callback that requires
+            a single argument for the future.
+        """
         # The done callback for concurrent.futures.Future will always pass a
         # the future in as the only argument. So we need to create the
         # proper signature wrapper that will invoke the callback provided.
         def done_callback(future_passed_to_callback):
-            return callback()
-        # Add the wrapped done callback to the future.
-        future.add_done_callback(done_callback)
+            return fn()
+        self._future.add_done_callback(done_callback)
+
+    def done(self):
+        return self._future.done()
+
+
+class BaseExecutor(object):
+    """Base Executor class implementation needed to work with s3transfer"""
+    def __init__(self, max_workers=None):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        raise NotImplementedError('submit()')
+
+    def shutdown(self, wait=True):
+        raise NotImplementedError('shutdown()')
+
+
+class NonThreadedExecutor(BaseExecutor):
+    """A drop-in replacement non-threaded version of ThreadPoolExecutor"""
+    def submit(self, fn, *args, **kwargs):
+        future = NonThreadedExecutorFuture()
+        try:
+            result = fn(*args, **kwargs)
+            future.set_result(result)
+        except Exception:
+            e, tb = sys.exc_info()[1:]
+            logger.debug(
+                'Setting exception for %s to %s with traceback %s',
+                future, e, tb
+            )
+            future.set_exception_info(e, tb)
+        return future
+
+    def shutdown(self, wait=True):
+        pass
+
+
+class NonThreadedExecutorFuture(object):
+    """The Future returned from NonThreadedExecutor
+
+    Note that this future is **not** thread-safe as it is being used
+    from the context of a non-threaded environment.
+    """
+    def __init__(self):
+        self._result = None
+        self._exception = None
+        self._traceback = None
+        self._done = False
+        self._done_callbacks = []
+
+    def set_result(self, result):
+        self._result = result
+        self._set_done()
+
+    def set_exception_info(self, exception, traceback):
+        self._exception = exception
+        self._traceback = traceback
+        self._set_done()
+
+    def result(self, timeout=None):
+        if self._exception:
+            six.reraise(
+                type(self._exception), self._exception, self._traceback)
+        return self._result
+
+    def _set_done(self):
+        self._done = True
+        for done_callback in self._done_callbacks:
+            self._invoke_done_callback(done_callback)
+        self._done_callbacks = []
+
+    def _invoke_done_callback(self, done_callback):
+        return done_callback(self)
+
+    def done(self):
+        return self._done
+
+    def add_done_callback(self, fn):
+        if self._done:
+            self._invoke_done_callback(fn)
+        else:
+            self._done_callbacks.append(fn)
 
 
 TaskTag = namedtuple('TaskTag', ['name'])

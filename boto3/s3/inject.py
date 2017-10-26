@@ -10,10 +10,11 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-from s3transfer.manager import TransferManager, TransferConfig
 from botocore.exceptions import ClientError
 
-from boto3.s3.transfer import S3Transfer, ProgressCallbackInvoker
+from boto3.s3.transfer import create_transfer_manager
+from boto3.s3.transfer import TransferConfig, S3Transfer
+from boto3.s3.transfer import ProgressCallbackInvoker
 from boto3 import utils
 
 
@@ -63,15 +64,19 @@ def bucket_load(self, *args, **kwargs):
 
     # We can't actually get the bucket's attributes from a HeadBucket,
     # so we need to use a ListBuckets and search for our bucket.
-    response = self.meta.client.list_buckets()
-    for bucket_data in response['Buckets']:
-        if bucket_data['Name'] == self.name:
-            self.meta.data = bucket_data
-            break
-    else:
-        raise ClientError({'Error': {'Code': '404', 'Message': 'NotFound'}},
-                          'ListBuckets')
-
+    # However, we may fail if we lack permissions to ListBuckets
+    # or the bucket is in another account. In which case, creation_date
+    # will be None.
+    self.meta.data = {}
+    try:
+        response = self.meta.client.list_buckets()
+        for bucket_data in response['Buckets']:
+            if bucket_data['Name'] == self.name:
+                self.meta.data = bucket_data
+                break
+    except ClientError as e:
+        if not e.response.get('Error', {}).get('Code') == 'AccessDenied':
+            raise
 
 def object_summary_load(self, *args, **kwargs):
     """
@@ -99,10 +104,10 @@ def upload_file(self, Filename, Bucket, Key, ExtraArgs=None,
     except that parameters are capitalized. Detailed examples can be found at
     :ref:`S3Transfer's Usage <ref_s3transfer_usage>`.
     """
-    transfer = S3Transfer(self, Config)
-    return transfer.upload_file(
-        filename=Filename, bucket=Bucket, key=Key,
-        extra_args=ExtraArgs, callback=Callback)
+    with S3Transfer(self, Config) as transfer:
+        return transfer.upload_file(
+            filename=Filename, bucket=Bucket, key=Key,
+            extra_args=ExtraArgs, callback=Callback)
 
 
 def download_file(self, Bucket, Key, Filename, ExtraArgs=None,
@@ -119,10 +124,10 @@ def download_file(self, Bucket, Key, Filename, ExtraArgs=None,
     except that parameters are capitalized. Detailed examples can be found at
     :ref:`S3Transfer's Usage <ref_s3transfer_usage>`.
     """
-    transfer = S3Transfer(self, Config)
-    return transfer.download_file(
-        bucket=Bucket, key=Key, filename=Filename,
-        extra_args=ExtraArgs, callback=Callback)
+    with S3Transfer(self, Config) as transfer:
+        return transfer.download_file(
+            bucket=Bucket, key=Key, filename=Filename,
+            extra_args=ExtraArgs, callback=Callback)
 
 
 def bucket_upload_file(self, Filename, Key,
@@ -258,7 +263,7 @@ def copy(self, CopySource, Bucket, Key, ExtraArgs=None, Callback=None,
     if config is None:
         config = TransferConfig()
 
-    with TransferManager(self, config) as manager:
+    with create_transfer_manager(self, config) as manager:
         future = manager.copy(
             copy_source=CopySource, bucket=Bucket, key=Key,
             extra_args=ExtraArgs, subscribers=subscribers,
@@ -419,7 +424,7 @@ def upload_fileobj(self, Fileobj, Bucket, Key, ExtraArgs=None,
     if config is None:
         config = TransferConfig()
 
-    with TransferManager(self, config) as manager:
+    with create_transfer_manager(self, config) as manager:
         future = manager.upload(
             fileobj=Fileobj, bucket=Bucket, key=Key,
             extra_args=ExtraArgs, subscribers=subscribers)
@@ -526,7 +531,7 @@ def download_fileobj(self, Bucket, Key, Fileobj, ExtraArgs=None,
             s3.download_fileobj('mybucket', 'mykey', data)
 
     :type Fileobj: a file-like object
-    :param Fileobj: A file-like object to upload. At a minimum, it must
+    :param Fileobj: A file-like object to download into. At a minimum, it must
         implement the `write` method and must accept bytes.
 
     :type Bucket: str
@@ -558,7 +563,7 @@ def download_fileobj(self, Bucket, Key, Fileobj, ExtraArgs=None,
     if config is None:
         config = TransferConfig()
 
-    with TransferManager(self, config) as manager:
+    with create_transfer_manager(self, config) as manager:
         future = manager.download(
             bucket=Bucket, key=Key, fileobj=Fileobj,
             extra_args=ExtraArgs, subscribers=subscribers)
@@ -577,14 +582,14 @@ def bucket_download_fileobj(self, Key, Fileobj, ExtraArgs=None,
     Usage::
 
         import boto3
-        s3 = boto3.client('s3')
+        s3 = boto3.resource('s3')
         bucket = s3.Bucket('mybucket')
 
         with open('filename', 'wb') as data:
             bucket.download_fileobj('mykey', data)
 
     :type Fileobj: a file-like object
-    :param Fileobj: A file-like object to upload. At a minimum, it must
+    :param Fileobj: A file-like object to download into. At a minimum, it must
         implement the `write` method and must accept bytes.
 
     :type Key: str
@@ -619,7 +624,7 @@ def object_download_fileobj(self, Fileobj, ExtraArgs=None, Callback=None,
     Usage::
 
         import boto3
-        s3 = boto3.client('s3')
+        s3 = boto3.resource('s3')
         bucket = s3.Bucket('mybucket')
         obj = bucket.Object('mykey')
 
@@ -627,7 +632,7 @@ def object_download_fileobj(self, Fileobj, ExtraArgs=None, Callback=None,
             obj.download_fileobj(data)
 
     :type Fileobj: a file-like object
-    :param Fileobj: A file-like object to upload. At a minimum, it must
+    :param Fileobj: A file-like object to download into. At a minimum, it must
         implement the `write` method and must accept bytes.
 
     :type ExtraArgs: dict

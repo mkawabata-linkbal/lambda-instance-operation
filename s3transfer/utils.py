@@ -13,25 +13,26 @@
 import random
 import time
 import functools
+import math
 import os
+import stat
 import string
 import logging
 import threading
+import io
 from collections import defaultdict
 
 from s3transfer.compat import rename_file
+from s3transfer.compat import seekable
 
 
+MAX_PARTS = 10000
+# The maximum file size you can upload via S3 per request.
+# See: http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
+# and: http://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
+MAX_SINGLE_UPLOAD_SIZE = 5 * (1024 ** 3)
+MIN_UPLOAD_CHUNKSIZE = 5 * (1024 ** 2)
 logger = logging.getLogger(__name__)
-
-
-def unique_id(name):
-    """
-    Generate a unique ID that includes the given name,
-    a timestamp and a random number.
-    """
-    return '{0}-{1}-{2}'.format(name, int(time.time()),
-                                random.randint(0, 10000))
 
 
 def random_file_extension(num_digits=8):
@@ -214,10 +215,12 @@ class OSUtils(object):
                                            enable_callbacks=False)
 
     def open_file_chunk_reader_from_fileobj(self, fileobj, chunk_size,
-                                            full_file_size, callbacks):
+                                            full_file_size, callbacks,
+                                            close_callbacks=None):
         return ReadFileChunk(
             fileobj, chunk_size, full_file_size,
-            callbacks=callbacks, enable_callbacks=False)
+            callbacks=callbacks, enable_callbacks=False,
+            close_callbacks=close_callbacks)
 
     def open(self, filename, mode):
         return open(filename, mode)
@@ -234,14 +237,41 @@ class OSUtils(object):
     def rename_file(self, current_filename, new_filename):
         rename_file(current_filename, new_filename)
 
+    def is_special_file(cls, filename):
+        """Checks to see if a file is a special UNIX file.
+
+        It checks if the file is a character special device, block special
+        device, FIFO, or socket.
+
+        :param filename: Name of the file
+
+        :returns: True if the file is a special file. False, if is not.
+        """
+        # If it does not exist, it must be a new file so it cannot be
+        # a special file.
+        if not os.path.exists(filename):
+            return False
+        mode = os.stat(filename).st_mode
+        # Character special device.
+        if stat.S_ISCHR(mode):
+            return True
+        # Block special device
+        if stat.S_ISBLK(mode):
+            return True
+        # Named pipe / FIFO
+        if stat.S_ISFIFO(mode):
+            return True
+        # Socket.
+        if stat.S_ISSOCK(mode):
+            return True
+        return False
+
 
 class DeferredOpenFile(object):
-    OPEN_METHOD = open
-
-    def __init__(self, filename, start_byte=0):
+    def __init__(self, filename, start_byte=0, mode='rb', open_function=open):
         """A class that defers the opening of a file till needed
 
-        This is useful for deffering opening of a file till it is needed
+        This is useful for deferring opening of a file till it is needed
         in a separate thread, as there is a limit of how many open files
         there can be in a single thread for most operating systems. The
         file gets opened in the following methods: ``read()``, ``seek()``,
@@ -252,19 +282,36 @@ class DeferredOpenFile(object):
 
         :type start_byte: int
         :param start_byte: The byte to seek to when the file is opened.
+
+        :type mode: str
+        :param mode: The mode to use to open the file
+
+        :type open_function: function
+        :param open_function: The function to use to open the file
         """
         self._filename = filename
         self._fileobj = None
         self._start_byte = start_byte
+        self._mode = mode
+        self._open_function = open_function
 
     def _open_if_needed(self):
         if self._fileobj is None:
-            self._fileobj = self.OPEN_METHOD(self._filename, 'rb')
-            self._fileobj.seek(self._start_byte)
+            self._fileobj = self._open_function(self._filename, self._mode)
+            if self._start_byte != 0:
+                self._fileobj.seek(self._start_byte)
+
+    @property
+    def name(self):
+        return self._filename
 
     def read(self, amount=None):
         self._open_if_needed()
         return self._fileobj.read(amount)
+
+    def write(self, data):
+        self._open_if_needed()
+        self._fileobj.write(data)
 
     def seek(self, where):
         self._open_if_needed()
@@ -289,7 +336,7 @@ class DeferredOpenFile(object):
 
 class ReadFileChunk(object):
     def __init__(self, fileobj, chunk_size, full_file_size,
-                 callbacks=None, enable_callbacks=True):
+                 callbacks=None, enable_callbacks=True, close_callbacks=None):
         """
 
         Given a file object shown below::
@@ -315,6 +362,13 @@ class ReadFileChunk(object):
         :param callbacks: Called whenever data is read from this object in the
             order provided.
 
+        :type enable_callbacks: boolean
+        :param enable_callbacks: True if to run callbacks. Otherwise, do not
+            run callbacks
+
+        :type close_callbacks: A list of function()
+        :param close_callbacks: Called when close is called. The function
+            should take no arguments.
         """
         self._fileobj = fileobj
         self._start_byte = self._fileobj.tell()
@@ -326,6 +380,9 @@ class ReadFileChunk(object):
         if callbacks is None:
             self._callbacks = []
         self._callbacks_enabled = enable_callbacks
+        self._close_callbacks = close_callbacks
+        if close_callbacks is None:
+            self._close_callbacks = close_callbacks
 
     @classmethod
     def from_filename(cls, filename, start_byte, chunk_size, callbacks=None,
@@ -391,6 +448,9 @@ class ReadFileChunk(object):
         self._amount_read = where
 
     def close(self):
+        if self._close_callbacks is not None and self._callbacks_enabled:
+            for callback in self._close_callbacks:
+                callback()
         self._fileobj.close()
 
     def tell(self):
@@ -567,3 +627,58 @@ class SlidingWindowSemaphore(TaskSemaphore):
                     "%s for tag: %s" % (sequence_number, tag))
         finally:
             self._condition.release()
+
+
+class ChunksizeAdjuster(object):
+    def __init__(self, max_size=MAX_SINGLE_UPLOAD_SIZE,
+                 min_size=MIN_UPLOAD_CHUNKSIZE, max_parts=MAX_PARTS):
+        self.max_size = max_size
+        self.min_size = min_size
+        self.max_parts = max_parts
+
+    def adjust_chunksize(self, current_chunksize, file_size=None):
+        """Get a chunksize close to current that fits within all S3 limits.
+
+        :type current_chunksize: int
+        :param current_chunksize: The currently configured chunksize.
+
+        :type file_size: int or None
+        :param file_size: The size of the file to upload. This might be None
+            if the object being transferred has an unknown size.
+
+        :returns: A valid chunksize that fits within configured limits.
+        """
+        chunksize = current_chunksize
+        if file_size is not None:
+            chunksize = self._adjust_for_max_parts(chunksize, file_size)
+        return self._adjust_for_chunksize_limits(chunksize)
+
+    def _adjust_for_chunksize_limits(self, current_chunksize):
+        if current_chunksize > self.max_size:
+            logger.debug(
+                "Chunksize greater than maximum chunksize. "
+                "Setting to %s from %s." % (self.max_size, current_chunksize))
+            return self.max_size
+        elif current_chunksize < self.min_size:
+            logger.debug(
+                "Chunksize less than minimum chunksize. "
+                "Setting to %s from %s." % (self.min_size, current_chunksize))
+            return self.min_size
+        else:
+            return current_chunksize
+
+    def _adjust_for_max_parts(self, current_chunksize, file_size):
+        chunksize = current_chunksize
+        num_parts = int(math.ceil(file_size / float(chunksize)))
+
+        while num_parts > self.max_parts:
+            chunksize *= 2
+            num_parts = int(math.ceil(file_size / float(chunksize)))
+
+        if chunksize != current_chunksize:
+            logger.debug(
+                "Chunksize would result in the number of parts exceeding the "
+                "maximum. Setting to %s from %s." %
+                (chunksize, current_chunksize))
+
+        return chunksize

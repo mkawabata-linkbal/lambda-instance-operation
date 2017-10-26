@@ -1,4 +1,4 @@
-# $Id: references.py 7624 2013-03-07 14:10:26Z milde $
+# $Id: references.py 8067 2017-05-04 20:10:03Z milde $
 # Author: David Goodger <goodger@python.org>
 # Copyright: This module has been placed in the public domain.
 
@@ -475,17 +475,17 @@ class Footnotes(Transform):
           # Entries 1-4 and 6 below are from section 12.51 of
           # The Chicago Manual of Style, 14th edition.
           '*',                          # asterisk/star
-          u'\u2020',                    # dagger &dagger;
-          u'\u2021',                    # double dagger &Dagger;
-          u'\u00A7',                    # section mark &sect;
-          u'\u00B6',                    # paragraph mark (pilcrow) &para;
+          '\u2020',                    # dagger &dagger;
+          '\u2021',                    # double dagger &Dagger;
+          '\u00A7',                    # section mark &sect;
+          '\u00B6',                    # paragraph mark (pilcrow) &para;
                                         # (parallels ['||'] in CMoS)
           '#',                          # number sign
           # The entries below were chosen arbitrarily.
-          u'\u2660',                    # spade suit &spades;
-          u'\u2665',                    # heart suit &hearts;
-          u'\u2666',                    # diamond suit &diams;
-          u'\u2663',                    # club suit &clubs;
+          '\u2660',                    # spade suit &spades;
+          '\u2665',                    # heart suit &hearts;
+          '\u2666',                    # diamond suit &diams;
+          '\u2663',                    # club suit &clubs;
           ]
 
     def apply(self):
@@ -710,6 +710,7 @@ class Substitutions(Transform):
                             raise CircularSubstitutionDefinitionError
                         else:
                             nested[nested_name].append(key)
+                            nested_ref['ref-origin'] = ref
                             subreflist.append(nested_ref)
                 except CircularSubstitutionDefinitionError:
                     parent = ref.parent
@@ -721,9 +722,13 @@ class Substitutions(Transform):
                             line=parent.line, base_node=parent)
                         parent.replace_self(msg)
                     else:
+                        # find original ref substitution which cased this error
+                        ref_origin = ref
+                        while ref_origin.hasattr('ref-origin'):
+                            ref_origin = ref_origin['ref-origin']
                         msg = self.document.reporter.error(
-                            'Circular substitution definition referenced: "%s".'
-                            % refname, base_node=ref)
+                            'Circular substitution definition referenced: '
+                            '"%s".' % refname, base_node=ref_origin)
                         msgid = self.document.set_id(msg)
                         prb = nodes.problematic(
                             ref.rawsource, ref.rawsource, refid=msgid)
@@ -893,7 +898,10 @@ class DanglingReferencesVisitor(nodes.SparseNodeVisitor):
                 msgid = self.document.set_id(msg)
                 prb = nodes.problematic(
                       node.rawsource, node.rawsource, refid=msgid)
-                prbid = self.document.set_id(prb)
+                try:
+                    prbid = node['ids'][0]
+                except IndexError:
+                    prbid = self.document.set_id(prb)
                 msg.add_backref(prbid)
                 node.replace_self(prb)
         else:

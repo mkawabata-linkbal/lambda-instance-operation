@@ -14,7 +14,8 @@ import copy
 import logging
 import threading
 
-from s3transfer.utils import unique_id
+from botocore.compat import six
+
 from s3transfer.utils import get_callbacks
 from s3transfer.utils import disable_upload_callbacks
 from s3transfer.utils import enable_upload_callbacks
@@ -22,6 +23,8 @@ from s3transfer.utils import CallArgs
 from s3transfer.utils import OSUtils
 from s3transfer.utils import TaskSemaphore
 from s3transfer.utils import SlidingWindowSemaphore
+from s3transfer.exceptions import CancelledError
+from s3transfer.exceptions import FatalError
 from s3transfer.futures import IN_MEMORY_DOWNLOAD_TAG
 from s3transfer.futures import IN_MEMORY_UPLOAD_TAG
 from s3transfer.futures import BoundedExecutor
@@ -31,6 +34,7 @@ from s3transfer.futures import TransferCoordinator
 from s3transfer.download import DownloadSubmissionTask
 from s3transfer.upload import UploadSubmissionTask
 from s3transfer.copies import CopySubmissionTask
+from s3transfer.delete import DeleteSubmissionTask
 
 KB = 1024
 MB = KB * KB
@@ -185,13 +189,23 @@ class TransferManager(object):
         'MetadataDirective'
     ]
 
-    def __init__(self, client, config=None, osutil=None):
+    ALLOWED_DELETE_ARGS = [
+        'MFA',
+        'VersionId',
+        'RequestPayer',
+    ]
+
+    def __init__(self, client, config=None, osutil=None, executor_cls=None):
         """A transfer manager interface for Amazon S3
 
         :param client: Client to be used by the manager
         :param config: TransferConfig to associate specific configurations
         :param osutil: OSUtils object to use for os-related behavior when
             using with transfer manager.
+
+        :type executor_cls: s3transfer.futures.BaseExecutor
+        :param executor_cls: The class of executor to use with the transfer
+            manager. By default, concurrent.futures.ThreadPoolExecutor is used.
         """
         self._client = client
         self._config = config
@@ -213,21 +227,25 @@ class TransferManager(object):
                     self._config.max_in_memory_upload_chunks),
                 IN_MEMORY_DOWNLOAD_TAG: SlidingWindowSemaphore(
                     self._config.max_in_memory_download_chunks)
-            }
+            },
+            executor_cls=executor_cls
         )
 
         # The executor responsible for submitting the necessary tasks to
         # perform the desired transfer
         self._submission_executor = BoundedExecutor(
             max_size=self._config.max_submission_queue_size,
-            max_num_threads=self._config.max_submission_concurrency
+            max_num_threads=self._config.max_submission_concurrency,
+            executor_cls=executor_cls
+
         )
 
         # There is one thread available for writing to disk. It will handle
         # downloads for all files.
         self._io_executor = BoundedExecutor(
             max_size=self._config.max_io_queue_size,
-            max_num_threads=1
+            max_num_threads=1,
+            executor_cls=executor_cls
         )
         self._register_handlers()
 
@@ -355,6 +373,39 @@ class TransferManager(object):
         )
         return self._submit_transfer(call_args, CopySubmissionTask)
 
+    def delete(self, bucket, key, extra_args=None, subscribers=None):
+        """Delete an S3 object.
+
+        :type bucket: str
+        :param bucket: The name of the bucket.
+
+        :type key: str
+        :param key: The name of the S3 object to delete.
+
+        :type extra_args: dict
+        :param extra_args: Extra arguments that may be passed to the
+            DeleteObject call.
+
+        :type subscribers: list
+        :param subscribers: A list of subscribers to be invoked during the
+            process of the transfer request.  Note that the ``on_progress``
+            callback is not invoked during object deletion.
+
+        :rtype: s3transfer.futures.TransferFuture
+        :return: Transfer future representing the deletion.
+
+        """
+        if extra_args is None:
+            extra_args = {}
+        if subscribers is None:
+            subscribers = []
+        self._validate_all_known_args(extra_args, self.ALLOWED_DELETE_ARGS)
+        call_args = CallArgs(
+            bucket=bucket, key=key, extra_args=extra_args,
+            subscribers=subscribers
+        )
+        return self._submit_transfer(call_args, DeleteSubmissionTask)
+
     def _validate_all_known_args(self, actual, allowed):
         for kwarg in actual:
             if kwarg not in allowed:
@@ -429,25 +480,34 @@ class TransferManager(object):
     def _register_handlers(self):
         # Register handlers to enable/disable callbacks on uploads.
         event_name = 'request-created.s3'
-        enable_id = unique_id('s3upload-callback-enable')
-        disable_id = unique_id('s3upload-callback-disable')
         self._client.meta.events.register_first(
-            event_name, disable_upload_callbacks, unique_id=disable_id)
+            event_name, disable_upload_callbacks,
+            unique_id='s3upload-callback-disable')
         self._client.meta.events.register_last(
-            event_name, enable_upload_callbacks, unique_id=enable_id)
+            event_name, enable_upload_callbacks,
+            unique_id='s3upload-callback-enable')
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, *args):
+    def __exit__(self, exc_type, exc_value, *args):
         cancel = False
+        cancel_msg = ''
+        cancel_exc_type = FatalError
         # If a exception was raised in the context handler, signal to cancel
         # all of the inprogress futures in the shutdown.
         if exc_type:
             cancel = True
-        self.shutdown(cancel)
+            cancel_msg = six.text_type(exc_value)
+            if not cancel_msg:
+                cancel_msg = repr(exc_value)
+            # If it was a KeyboardInterrupt, the cancellation was initiated
+            # by the user.
+            if isinstance(exc_value, KeyboardInterrupt):
+                cancel_exc_type = CancelledError
+        self._shutdown(cancel, cancel_msg, cancel_exc_type)
 
-    def shutdown(self, cancel=False):
+    def shutdown(self, cancel=False, cancel_msg=''):
         """Shutdown the TransferManager
 
         It will wait till all transfers complete before it completely shuts
@@ -457,23 +517,32 @@ class TransferManager(object):
         :param cancel: If True, calls TransferFuture.cancel() for
             all in-progress in transfers. This is useful if you want the
             shutdown to happen quicker.
+
+        :type cancel_msg: str
+        :param cancel_msg: The message to specify if canceling all in-progress
+            transfers.
         """
+        self._shutdown(cancel, cancel, cancel_msg)
+
+    def _shutdown(self, cancel, cancel_msg, exc_type=CancelledError):
         if cancel:
             # Cancel all in-flight transfers if requested, before waiting
             # for them to complete.
-            self._coordinator_controller.cancel()
+            self._coordinator_controller.cancel(cancel_msg, exc_type)
         try:
             # Wait until there are no more in-progress transfers. This is
             # wrapped in a try statement because this can be interrupted
             # with a KeyboardInterrupt that needs to be caught.
             self._coordinator_controller.wait()
-        finally:
+        except KeyboardInterrupt:
             # If not errors were raised in the try block, the cancel should
             # have no coordinators it needs to run cancel on. If there was
             # an error raised in the try statement we want to cancel all of
             # the inflight transfers before shutting down to speed that
             # process up.
-            self._coordinator_controller.cancel()
+            self._coordinator_controller.cancel('KeyboardInterrupt()')
+            raise
+        finally:
             # Shutdown all of the executors.
             self._submission_executor.shutdown()
             self._request_executor.shutdown()
@@ -522,14 +591,19 @@ class TransferCoordinatorController(object):
         with self._lock:
             self._tracked_transfer_coordinators.remove(transfer_coordinator)
 
-    def cancel(self):
+    def cancel(self, msg='', exc_type=CancelledError):
         """Cancels all inprogress transfers
 
         This cancels the inprogress transfers by calling cancel() on all
         tracked transfer coordinators.
+
+        :param msg: The message to pass on to each transfer coordinator that
+            gets cancelled.
+
+        :param exc_type: The type of exception to set for the cancellation
         """
         for transfer_coordinator in self.tracked_transfer_coordinators:
-            transfer_coordinator.cancel()
+            transfer_coordinator.cancel(msg, exc_type)
 
     def wait(self):
         """Wait until there are no more inprogress transfers
@@ -539,6 +613,7 @@ class TransferCoordinatorController(object):
         a KeyboardInterrupt.
         """
         try:
+            transfer_coordinator = None
             for transfer_coordinator in self.tracked_transfer_coordinators:
                 transfer_coordinator.result()
         except KeyboardInterrupt:
@@ -546,6 +621,10 @@ class TransferCoordinatorController(object):
             # If Keyboard interrupt is raised while waiting for
             # the result, then exit out of the wait and raise the
             # exception
+            if transfer_coordinator:
+                logger.debug(
+                    'On KeyboardInterrupt was waiting for %s',
+                    transfer_coordinator)
             raise
         except Exception:
             # A general exception could have been thrown because

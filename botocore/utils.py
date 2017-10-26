@@ -18,8 +18,8 @@ import hashlib
 import binascii
 import functools
 import weakref
+import random
 
-from six import string_types, text_type
 import dateutil.parser
 from dateutil.tz import tzlocal, tzutc
 
@@ -29,7 +29,7 @@ from botocore.exceptions import InvalidDNSNameError, ClientError
 from botocore.exceptions import MetadataRetrievalError
 from botocore.compat import json, quote, zip_longest, urlsplit, urlunsplit
 from botocore.vendored import requests
-from botocore.compat import OrderedDict
+from botocore.compat import OrderedDict, six
 
 
 logger = logging.getLogger(__name__)
@@ -40,18 +40,33 @@ METADATA_SECURITY_CREDENTIALS_URL = (
 # These are chars that do not need to be urlencoded.
 # Based on rfc2986, section 2.3
 SAFE_CHARS = '-._~'
-LABEL_RE = re.compile('[a-z0-9][a-z0-9\-]*[a-z0-9]')
+LABEL_RE = re.compile(r'[a-z0-9][a-z0-9\-]*[a-z0-9]')
 RESTRICTED_REGIONS = [
     'us-gov-west-1',
     'fips-us-gov-west-1',
 ]
-S3_ACCELERATE_ENDPOINT = 's3-accelerate.amazonaws.com'
 RETRYABLE_HTTP_ERRORS = (requests.Timeout, requests.ConnectionError)
+S3_ACCELERATE_WHITELIST = ['dualstack']
 
 
 class _RetriesExceededError(Exception):
     """Internal exception used when the number of retries are exceeded."""
     pass
+
+
+def is_json_value_header(shape):
+    """Determines if the provided shape is the special header type jsonvalue.
+
+    :type shape: botocore.shape
+    :param shape: Shape to be inspected for the jsonvalue trait.
+
+    :return: True if this type is a jsonvalue, False otherwise
+    :rtype: Bool
+    """
+    return (hasattr(shape, 'serialization') and
+            shape.serialization.get('jsonvalue', False) and
+            shape.serialization.get('location') == 'header' and
+            shape.type_name == 'string')
 
 
 def get_service_module_name(service_model):
@@ -65,7 +80,7 @@ def get_service_module_name(service_model):
             'serviceFullName', service_model.service_name))
     name = name.replace('Amazon', '')
     name = name.replace('AWS', '')
-    name = re.sub('\W+', '', name)
+    name = re.sub(r'\W+', '', name)
     return name
 
 
@@ -304,10 +319,18 @@ def percent_encode(input_str, safe=SAFE_CHARS):
     producing a percent encoded string, this function deals only with
     taking a string (not a dict/sequence) and percent encoding it.
 
+    If given the binary type, will simply URL encode it. If given the
+    text type, will produce the binary type by UTF-8 encoding the
+    text. If given something else, will convert it to the the text type
+    first.
     """
-    if not isinstance(input_str, string_types):
-        input_str = text_type(input_str)
-    return quote(text_type(input_str).encode('utf-8'), safe=safe)
+    # If its not a binary or text string, make it a text string.
+    if not isinstance(input_str, (six.binary_type, six.text_type)):
+        input_str = six.text_type(input_str)
+    # If it's not bytes, make it bytes by UTF-8 encoding it.
+    if not isinstance(input_str, six.binary_type):
+        input_str = input_str.encode('utf-8')
+    return quote(input_str, safe=safe)
 
 
 def parse_timestamp(value):
@@ -331,7 +354,10 @@ def parse_timestamp(value):
         except (TypeError, ValueError):
             pass
     try:
-        return dateutil.parser.parse(value)
+        # In certain cases, a timestamp marked with GMT can be parsed into a
+        # different time zone, so here we provide a context which will
+        # enforce that GMT == UTC.
+        return dateutil.parser.parse(value, tzinfos={'GMT': tzutc()})
     except (TypeError, ValueError) as e:
         raise ValueError('Invalid timestamp "%s": %s' % (value, e))
 
@@ -503,12 +529,13 @@ class ArgumentGenerator(object):
     """Generate sample input based on a shape model.
 
     This class contains a ``generate_skeleton`` method that will take
-    an input shape (created from ``botocore.model``) and generate
-    a sample dictionary corresponding to the input shape.
+    an input/output shape (created from ``botocore.model``) and generate
+    a sample dictionary corresponding to the input/output shape.
 
-    The specific values used are place holder values. For strings an
-    empty string is used, for numbers 0 or 0.0 is used.  The intended
-    usage of this class is to generate the *shape* of the input structure.
+    The specific values used are place holder values. For strings either an
+    empty string or the member name can be used, for numbers 0 or 0.0 is used.
+    The intended usage of this class is to generate the *shape* of the input
+    structure.
 
     This can be useful for operations that have complex input shapes.
     This allows a user to just fill in the necessary data instead of
@@ -524,8 +551,8 @@ class ArgumentGenerator(object):
         print("Sample input for dynamodb.CreateTable: %s" % sample_input)
 
     """
-    def __init__(self):
-        pass
+    def __init__(self, use_member_names=False):
+        self._use_member_names = use_member_names
 
     def generate_skeleton(self, shape):
         """Generate a sample input.
@@ -540,7 +567,7 @@ class ArgumentGenerator(object):
         stack = []
         return self._generate_skeleton(shape, stack)
 
-    def _generate_skeleton(self, shape, stack):
+    def _generate_skeleton(self, shape, stack, name=''):
         stack.append(shape.name)
         try:
             if shape.type_name == 'structure':
@@ -550,6 +577,10 @@ class ArgumentGenerator(object):
             elif shape.type_name == 'map':
                 return self._generate_type_map(shape, stack)
             elif shape.type_name == 'string':
+                if self._use_member_names:
+                    return name
+                if shape.enum:
+                    return random.choice(shape.enum)
                 return ''
             elif shape.type_name in ['integer', 'long']:
                 return 0
@@ -557,6 +588,8 @@ class ArgumentGenerator(object):
                 return 0.0
             elif shape.type_name == 'boolean':
                 return True
+            elif shape.type_name == 'timestamp':
+                return datetime.datetime(1970, 1, 1, 0, 0, 0)
         finally:
             stack.pop()
 
@@ -565,15 +598,18 @@ class ArgumentGenerator(object):
             return {}
         skeleton = OrderedDict()
         for member_name, member_shape in shape.members.items():
-            skeleton[member_name] = self._generate_skeleton(member_shape,
-                                                            stack)
+            skeleton[member_name] = self._generate_skeleton(
+                member_shape, stack, name=member_name)
         return skeleton
 
     def _generate_type_list(self, shape, stack):
         # For list elements we've arbitrarily decided to
         # return two elements for the skeleton list.
+        name = ''
+        if self._use_member_names:
+            name = shape.member.name
         return [
-            self._generate_skeleton(shape.member, stack),
+            self._generate_skeleton(shape.member, stack, name),
         ]
 
     def _generate_type_map(self, shape, stack):
@@ -604,7 +640,7 @@ def is_valid_endpoint_url(endpoint_url):
     if hostname[-1] == ".":
         hostname = hostname[:-1]
     allowed = re.compile(
-        "^((?!-)[A-Z\d-]{1,63}(?<!-)\.)*((?!-)[A-Z\d-]{1,63}(?<!-))$",
+        r"^((?!-)[A-Z\d-]{1,63}(?<!-)\.)*((?!-)[A-Z\d-]{1,63}(?<!-))$",
         re.IGNORECASE)
     return allowed.match(hostname)
 
@@ -772,7 +808,13 @@ def switch_host_s3_accelerate(request, operation_name, **kwargs):
     # before it gets changed to virtual. So we are not concerned with ensuring
     # that the bucket name is translated to the virtual style here and we
     # can hard code the Accelerate endpoint.
-    endpoint = 'https://' + S3_ACCELERATE_ENDPOINT
+    parts = urlsplit(request.url).netloc.split('.')
+    parts = [p for p in parts if p in S3_ACCELERATE_WHITELIST]
+    endpoint = 'https://s3-accelerate.'
+    if len(parts) > 0:
+        endpoint += '.'.join(parts) + '.'
+    endpoint += 'amazonaws.com'
+
     if operation_name in ['ListBuckets', 'CreateBucket', 'DeleteBucket']:
         return
     _switch_hosts(request, endpoint,  use_new_scheme=False)
@@ -809,6 +851,24 @@ def _get_new_endpoint(original_endpoint, new_endpoint, use_new_scheme=True):
     logger.debug('Updating URI from %s to %s' % (
         original_endpoint, final_endpoint))
     return final_endpoint
+
+
+def deep_merge(base, extra):
+    """Deeply two dictionaries, overriding existing keys in the base.
+
+    :param base: The base dictionary which will be merged into.
+    :param extra: The dictionary to merge into the base. Keys from this
+        dictionary will take precedence.
+    """
+    for key in extra:
+        # If the key represents a dict on both given dicts, merge the sub-dicts
+        if key in base and isinstance(base[key], dict)\
+                and isinstance(extra[key], dict):
+            deep_merge(base[key], extra[key])
+            continue
+
+        # Otherwise, set the key on the base to be the value of the extra.
+        base[key] = extra[key]
 
 
 class S3RegionRedirector(object):
@@ -944,12 +1004,40 @@ class ContainerMetadataFetcher(object):
     RETRY_ATTEMPTS = 3
     SLEEP_TIME = 1
     IP_ADDRESS = '169.254.170.2'
+    _ALLOWED_HOSTS = [IP_ADDRESS, 'localhost', '127.0.0.1']
 
     def __init__(self, session=None, sleep=time.sleep):
         if session is None:
             session = requests.Session()
         self._session = session
         self._sleep = sleep
+
+    def retrieve_full_uri(self, full_url, headers=None):
+        """Retrieve JSON metadata from container metadata.
+
+        :type full_url: str
+        :param full_url: The full URL of the metadata service.
+            This should include the scheme as well, e.g
+            "http://localhost:123/foo"
+
+        """
+        self._validate_allowed_url(full_url)
+        return self._retrieve_credentials(full_url, headers)
+
+    def _validate_allowed_url(self, full_url):
+        parsed = botocore.compat.urlparse(full_url)
+        is_whitelisted_host = self._check_if_whitelisted_host(
+            parsed.hostname)
+        if not is_whitelisted_host:
+            raise ValueError(
+                "Unsupported host '%s'.  Can only "
+                "retrieve metadata from these hosts: %s" %
+                (parsed.hostname, ', '.join(self._ALLOWED_HOSTS)))
+
+    def _check_if_whitelisted_host(self, host):
+        if host in self._ALLOWED_HOSTS:
+            return True
+        return False
 
     def retrieve_uri(self, relative_uri):
         """Retrieve JSON metadata from ECS metadata.
@@ -960,15 +1048,20 @@ class ContainerMetadataFetcher(object):
         :return: The parsed JSON response.
 
         """
-        full_url = self._full_url(relative_uri)
+        full_url = self.full_url(relative_uri)
+        return self._retrieve_credentials(full_url)
+
+    def _retrieve_credentials(self, full_url, extra_headers=None):
         headers = {'Accept': 'application/json'}
+        if extra_headers is not None:
+            headers.update(extra_headers)
         attempts = 0
         while True:
             try:
                 return self._get_response(full_url, headers, self.TIMEOUT_SECONDS)
             except MetadataRetrievalError as e:
                 logger.debug("Received error when attempting to retrieve "
-                             "ECS metadata: %s", e, exc_info=True)
+                             "container metadata: %s", e, exc_info=True)
                 self._sleep(self.SLEEP_TIME)
                 attempts += 1
                 if attempts >= self.RETRY_ATTEMPTS:
@@ -993,5 +1086,5 @@ class ContainerMetadataFetcher(object):
                          "ECS metadata: %s" % e)
             raise MetadataRetrievalError(error_msg=error_msg)
 
-    def _full_url(self, relative_uri):
+    def full_url(self, relative_uri):
         return 'http://%s%s' % (self.IP_ADDRESS, relative_uri)
